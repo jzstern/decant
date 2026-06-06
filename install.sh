@@ -23,7 +23,7 @@ echo "installed: $services_dir/$workflow"
 /System/Library/CoreServices/pbs -update 2>/dev/null || true
 
 echo
-echo "Done. Right-click files or folders in Finder → Quick Actions → \"Convert to AIFF\"."
+echo "Done. Right-click files or folders in Finder → Quick Actions → \"→ aiff\"."
 echo "Or run from Terminal: $bin_dir/toaiff /path/to/file-or-folder"
 case ":$PATH:" in
   *":$bin_dir:"*) ;;
