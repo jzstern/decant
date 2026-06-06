@@ -67,3 +67,30 @@ artwork is dropped with a logged note.
 The `.aiff` is written to a temporary file first. The original is only trashed
 after ffmpeg succeeds and the output is verified non-empty; on any failure the
 original is left exactly as it was.
+
+## Logging
+
+Every run appends to `~/Library/Logs/toaiff.log` — one line per converted,
+skipped, or failed file, plus the underlying ffmpeg error on failure. This
+matters most for the Finder Quick Action, which otherwise discards all output:
+
+```sh
+tail -f ~/Library/Logs/toaiff.log
+```
+
+## Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `TOAIFF_KEEP_ORIGINALS` | Convert without trashing originals (cautious first pass / testing). |
+| `TOAIFF_LOG` | Override the log file path. |
+
+## Tests
+
+```sh
+./tests/run.sh
+```
+
+Generates fixtures with ffmpeg and exercises depth preservation, metadata and
+artwork retention, recursion, lossy/non-audio skipping, and logging — all
+non-destructively (no files are trashed).

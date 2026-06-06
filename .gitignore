@@ -1,2 +1,3 @@
 .DS_Store
 *.toaiff.partial.aiff
+.worktrees/
