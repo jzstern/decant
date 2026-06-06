@@ -19,8 +19,15 @@ run if it isn't already present.
 
 ## Use
 
-**Finder:** right-click any files or folders → **Quick Actions → → aiff**.
+**Finder:** right-click any files or folders → **Services → → aiff**.
 A notification reports how many files were converted / skipped / failed.
+
+> **Protected folders:** macOS sandboxes Finder Quick Actions and denies them
+> write/rename access inside the three TCC-protected folders — **Desktop,
+> Documents, and Downloads**. Running the action on files there fails safely
+> (the original is left untouched and the error is logged). Everywhere else
+> (`~/Music`, external drives, any other folder) it works normally. Use the
+> CLI for protected folders, or move the files out first.
 
 **Terminal:**
 
