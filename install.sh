@@ -8,7 +8,7 @@ set -e
 here="${0:A:h}"
 bin_dir="$HOME/.local/bin"
 services_dir="$HOME/Library/Services"
-workflow="Convert to AIFF.workflow"
+workflow="→ aiff.workflow"
 
 mkdir -p "$bin_dir" "$services_dir"
 

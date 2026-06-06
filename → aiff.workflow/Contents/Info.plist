@@ -8,7 +8,7 @@
 			<key>NSMenuItem</key>
 			<dict>
 				<key>default</key>
-				<string>Convert to AIFF</string>
+				<string>→ aiff</string>
 			</dict>
 			<key>NSMessage</key>
 			<string>runWorkflowAsService</string>

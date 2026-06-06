@@ -19,7 +19,7 @@ run if it isn't already present.
 
 ## Use
 
-**Finder:** right-click any files or folders → **Quick Actions → Convert to AIFF**.
+**Finder:** right-click any files or folders → **Quick Actions → → aiff**.
 A notification reports how many files were converted / skipped / failed.
 
 **Terminal:**
