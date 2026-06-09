@@ -5,7 +5,8 @@ preserving all available artwork and metadata. Works on a single file or a
 folder (recursing into every subfolder). Lossy and non-audio files are left
 untouched. Each original is moved to the **Trash** once its `.aiff` is written.
 
-Ships as a Finder **Quick Action** (right-click) and a CLI.
+Runs as a CLI, plus a one-time **Shortcuts** Quick Action for right-clicking in
+Finder.
 
 ## Install
 
@@ -13,28 +14,39 @@ Ships as a Finder **Quick Action** (right-click) and a CLI.
 ./install.sh
 ```
 
-This copies the CLI to `~/.local/bin/toaiff` and the Quick Action to
-`~/Library/Services/`. ffmpeg is installed automatically via Homebrew on first
-run if it isn't already present.
+This copies the CLI to `~/.local/bin/toaiff`. ffmpeg is installed automatically
+via Homebrew on first run if it isn't already present.
 
-## Use
-
-**Finder:** right-click any files or folders → **Services → → aiff**.
-A notification reports how many files were converted / skipped / failed.
-
-> **Protected folders:** macOS sandboxes Finder Quick Actions and denies them
-> write/rename access inside the three TCC-protected folders — **Desktop,
-> Documents, and Downloads**. Running the action on files there fails safely
-> (the original is left untouched and the error is logged). Everywhere else
-> (`~/Music`, external drives, any other folder) it works normally. Use the
-> CLI for protected folders, or move the files out first.
-
-**Terminal:**
+## Use from Terminal
 
 ```sh
 toaiff ~/Music/Album            # recurse a folder
 toaiff track.flac other.wav     # one or more files
 ```
+
+## Finder Quick Action
+
+On macOS Sequoia/Tahoe, a true Finder **Quick Action** must be a Shortcut or an
+app extension — a hand-built Automator `.workflow` only ever registers as a
+*Service*. So the right-click integration is a Shortcut that calls the CLI. Set
+it up once (~1 minute):
+
+1. Open **Shortcuts.app** → **File ▸ New Shortcut** (⌘N).
+2. In the right-hand details panel (ⓘ), tick **Use as Quick Action** and
+   **Finder**. Set **Receive** to **Files and Folders**.
+3. Search the actions list for **Run Shell Script** and drag it in. Configure:
+   - **Shell:** `zsh`
+   - **Pass Input:** **as arguments**
+   - **Script:** `"$HOME/.local/bin/toaiff" --notify "$@"`
+4. Rename the shortcut (top of the window) to **→ aiff**.
+5. Now right-click files/folders in Finder → **Quick Actions → → aiff**.
+
+> **Protected folders:** shell scripts launched from Finder are sandboxed and
+> can't write inside **Desktop, Documents, and Downloads** unless you grant
+> access. To enable those folders, add **Shortcuts** under **System Settings ▸
+> Privacy & Security ▸ Full Disk Access**. Without it, runs there fail safely
+> (the original is left untouched and the error is logged) — everywhere else
+> (`~/Music`, external drives, …) it works out of the box.
 
 ## What gets converted
 

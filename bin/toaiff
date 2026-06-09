@@ -126,6 +126,9 @@ process_file() {
   local src="$1"
   local ext="${src:e:l}"
 
+  # Empty file → skip (treat like a non-audio file, never a failure).
+  [[ -s "$src" ]] || return
+
   local info codec bits fmt
   info=$(ffprobe -v error -select_streams a:0 \
            -show_entries stream=codec_name,sample_fmt,bits_per_raw_sample \
@@ -147,6 +150,13 @@ process_file() {
 
   bits=$(print -r -- "$info" | awk -F= '$1=="bits_per_raw_sample"{print $2; exit}')
   fmt=$(print -r -- "$info" | awk -F= '$1=="sample_fmt"{print $2; exit}')
+
+  # Truncated/corrupt file: ffprobe guessed the codec from the extension but
+  # cannot determine a sample format. Skip rather than fail the whole run.
+  if [[ -z "$fmt" || "$fmt" == "unknown" ]]; then
+    log_line "SKIP (unreadable audio) $src"
+    (( skipped++ )); return
+  fi
 
   local dest="${src:r}.aiff"
   if [[ -e "$dest" && "${dest:A}" != "${src:A}" ]]; then

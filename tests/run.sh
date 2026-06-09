@@ -49,12 +49,16 @@ gen_flac24_with_art() {
 
 gen_flac24_with_art
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=220:duration=1" -c:a pcm_s16le "$WORK/sub/tone16.wav"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=300:duration=1" -c:a pcm_s24le \
+  -metadata title="Wav Meta" -metadata artist="toaiff" "$WORK/tagged24.wav"
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=330:duration=1" -c:a libmp3lame -q:a 4 "$WORK/song.mp3"
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=550:duration=1" -c:a pcm_s16be "$WORK/already.aiff"
 print -r -- "not audio" > "$WORK/readme.txt"
+: > "$WORK/corrupt.flac"   # 0-byte file with a lossless extension
 
 # #when the whole tree is converted (recursively, keeping originals)
 TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" "$WORK" >/dev/null
+typeset -i run_rc=$?
 
 print -r -- "24-bit FLAC → AIFF"
 assert_eq   "produces a pcm_s24be AIFF (depth preserved, no downsampling)" \
@@ -71,7 +75,15 @@ print -r -- "16-bit WAV in a subfolder"
 assert_true "is converted (recursion into subfolders works)" \
             test -f "$WORK/sub/tone16.aiff"
 
-print -r -- "lossy + non-audio + existing AIFF"
+print -r -- "24-bit WAV with metadata"
+assert_eq   "converts to pcm_s24be (depth preserved)" \
+            "pcm_s24be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$WORK/tagged24.aiff")"
+assert_eq   "carries the WAV title tag into the AIFF" \
+            "Wav Meta" \
+            "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$WORK/tagged24.aiff")"
+
+print -r -- "lossy + non-audio + existing AIFF + corrupt"
 assert_true "MP3 is left untouched (no sibling AIFF created)" \
             test ! -f "$WORK/song.aiff"
 assert_true "non-audio .txt is ignored (no sibling AIFF created)" \
@@ -79,6 +91,10 @@ assert_true "non-audio .txt is ignored (no sibling AIFF created)" \
 assert_eq   "existing AIFF is left bit-identical (skipped, not re-encoded)" \
             "pcm_s16be" \
             "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$WORK/already.aiff")"
+assert_true "a 0-byte/corrupt .flac is skipped, not failed (no AIFF written)" \
+            test ! -f "$WORK/corrupt.aiff"
+assert_eq   "the run exits 0 even with a corrupt file present" \
+            "0" "$run_rc"
 
 print -r -- "originals + logging"
 assert_true "originals are preserved when TOAIFF_KEEP_ORIGINALS is set" \
