@@ -19,21 +19,23 @@ path=(/opt/homebrew/bin /usr/local/bin $path)
 
 NOTIFY=0
 DEBUG=0
+DRYRUN=0
 [[ -n "${TOAIFF_DEBUG:-}" ]] && DEBUG=1
 while true; do
   case "${1:-}" in
-    --notify) NOTIFY=1; shift ;;
-    --debug)  DEBUG=1; shift ;;
+    --notify)  NOTIFY=1; shift ;;
+    --debug)   DEBUG=1; shift ;;
+    --dry-run) DRYRUN=1; shift ;;
     *) break ;;
   esac
 done
 
 if (( $# == 0 )); then
-  print -u2 "usage: toaiff [--notify] [--debug] PATH [PATH ...]"
+  print -u2 "usage: toaiff [--notify] [--debug] [--dry-run] PATH [PATH ...]"
   exit 64
 fi
 
-typeset -i converted=0 skipped=0 failed=0
+typeset -i converted=0 skipped=0 failed=0 previewed=0
 
 # One central, always-appended log regardless of where the action is run from.
 # (TOAIFF_LOG only overrides the path for the test suite.)
@@ -120,6 +122,114 @@ target_codec() {
   fi
 }
 
+# ── Metadata enrichment ─────────────────────────────────────────────────────
+# Derive tags that live in folder/file names but are missing from the audio
+# tags, and normalise feat.→ft. All derivation is fill-gaps-only (set by
+# build_meta_args); the only value that is *edited* rather than gap-filled is a
+# title containing "feat.".
+
+# Replace the word "feat." (any case) with "ft." in a title. The literal dot is
+# required, so "FEISTY"/"feature" are left alone. Idempotent.
+normalize_feat() {
+  print -r -- "${1//(#bi)feat./ft.}"
+}
+
+# Tokens that look like letters+digits but are format/quality markers, not
+# catalog numbers.
+_cat_blocklist=(FLAC WAV WAVE W64 RF64 BWF MP3 AAC ALAC APE WV WEB WEBFLAC \
+  CD VINYL EP LP VA OST MIXTAPE REMIX REMIXES MP4 M4A AIFF AIF)
+
+# True if TOKEN looks like a catalog number: starts with >=2 letters, is
+# otherwise alphanumeric (separators allowed), and contains a run of >=2 digits
+# somewhere — so it matches both simple codes (SHA300, NB011EP) and segmented
+# ones (BASS372D003, SLSS-012). Rejects blocklisted words, years, pure-digit
+# barcodes, and bit/rate strings.
+_is_catalog_token() {
+  local t="${1:u}"
+  [[ "$t" == [A-Z](#c2,)[-_A-Z0-9]# ]] || return 1
+  [[ "$t" == *[0-9][0-9]* ]] || return 1
+  (( ${_cat_blocklist[(I)$t]} )) && return 1
+  [[ "$t" == (19|20)[0-9][0-9] ]] && return 1
+  [[ "$t" == [0-9]## ]] && return 1
+  [[ "$t" == *(KHZ|BIT|KBPS|HZ)* ]] && return 1
+  return 0
+}
+
+# Echo an uppercase catalog number found in an album folder name, or nothing.
+# Prefers a bracketed token ([], (), {}) over a bare scene token; on ties takes
+# the last one.
+detect_catalog() {
+  local name="$1" tok winner="" g
+  local -a bracketed bare groups
+  groups=("${(@f)$(print -r -- "$name" | grep -oE '\[[^]]+\]|\([^)]+\)|\{[^}]+\}')}")
+  for g in $groups; do
+    for tok in ${(s: :)${g//[][(){}]/ }}; do
+      _is_catalog_token "$tok" && bracketed+=("${tok:u}")
+    done
+  done
+  for tok in ${(s: :)${name//[-_]/ }}; do
+    _is_catalog_token "$tok" && bare+=("${tok:u}")
+  done
+  if   (( ${#bracketed} )); then winner="${bracketed[-1]}"
+  elif (( ${#bare} ));      then winner="${bare[-1]}"
+  fi
+  [[ -n "$winner" ]] && print -r -- "$winner"
+}
+
+# Echo "disc=N" and/or "track=N" parsed from the LEADING token of a filename
+# (so trailing numbers like a year in the title are never mistaken for a track).
+derive_track_disc() {
+  local base="${1:t:r}"
+  local -a out
+  if [[ "$base" == (#b)[[:space:]]#\(([[:space:]]#<1-99>)[[:space:]]#-[[:space:]]#([[:space:]]#<1-999>)[[:space:]]#\)* ]]; then
+    out=("disc=$((match[1]))" "track=$((match[2]))")
+  elif [[ "$base" == (#b)[[:space:]]#(<1-999>)[[:space:]]#[-._\)]* ]]; then
+    out=("track=$((match[1]))")
+  fi
+  (( ${#out} )) && print -r -- "${out}"
+}
+
+# Echo the path to album-folder cover art (cover/folder/front .jpg/.jpeg/.png),
+# or nothing.
+find_folder_art() {
+  local dir="$1" f
+  for f in "$dir"/(#i)(cover|folder|front).(jpg|jpeg|png)(N); do
+    [[ -f "$f" ]] && { print -r -- "$f"; return; }
+  done
+}
+
+# Build META_ARGS (ffmpeg -metadata args), META_PLAN (human-readable summary)
+# and ART_INPUT (a cover image to embed) for SRC, given its existing tags.
+# Fill-gaps-only: derived fields are written only where the source tag is empty.
+build_meta_args() {
+  local src="$1" cur_track="$2" cur_disc="$3" cur_grouping="$4" cur_title="$5" has_art="$6"
+  META_ARGS=(); META_PLAN=(); ART_INPUT=""
+  local dir="${src:h}" folder="${src:h:t}" base="${src:t}"
+
+  if [[ -z "$cur_grouping" ]]; then
+    local cat; cat=$(detect_catalog "$folder")
+    [[ -n "$cat" ]] && { META_ARGS+=(-metadata "grouping=$cat"); META_PLAN+=("grouping=$cat"); }
+  fi
+
+  local td kv k; td=$(derive_track_disc "$base")
+  for kv in ${(s: :)td}; do
+    k="${kv%%=*}"
+    [[ "$k" == track && -n "$cur_track" ]] && continue
+    [[ "$k" == disc  && -n "$cur_disc"  ]] && continue
+    META_ARGS+=(-metadata "$kv"); META_PLAN+=("$kv")
+  done
+
+  if [[ -n "$cur_title" ]]; then
+    local nt; nt=$(normalize_feat "$cur_title")
+    [[ "$nt" != "$cur_title" ]] && { META_ARGS+=(-metadata "title=$nt"); META_PLAN+=("title=$nt"); }
+  fi
+
+  if [[ "$has_art" != 1 ]]; then
+    local art; art=$(find_folder_art "$dir")
+    [[ -n "$art" ]] && { ART_INPUT="$art"; META_PLAN+=("art=${art:t}"); }
+  fi
+}
+
 trash_original() {
   [[ -n "${TOAIFF_KEEP_ORIGINALS:-}" ]] && return 0
   local abs="${1:A}"
@@ -160,16 +270,26 @@ convert_file() {
   local src="$1" tgt="$2" out="$3"
   CONVERT_ERR=""
   ART_DROPPED=0
-  # First attempt keeps every stream (audio + embedded cover art).
+  local -a inputs map
+  inputs=(-i "$src")
+  map=(-map 0)
+  # Embed album-folder art (set by build_meta_args) only when the source has
+  # none of its own.
+  if [[ -n "$ART_INPUT" ]]; then
+    inputs+=(-i "$ART_INPUT")
+    map+=(-map 1:v -disposition:v attached_pic)
+  fi
+  # First attempt keeps every stream (audio + embedded/folder cover art) and
+  # applies the enrichment -metadata after -map_metadata so it overrides/adds.
   if ffmpeg -nostdin -hide_banner -loglevel error -y \
-        -i "$src" -map 0 -map_metadata 0 \
+        "${inputs[@]}" "${map[@]}" -map_metadata 0 "${META_ARGS[@]}" \
         -c:a "$tgt" -c:v copy -write_id3v2 1 -f aiff "$out" 2>/dev/null; then
     return 0
   fi
   # Fallback: audio + metadata only (drops art the AIFF muxer rejected).
   local err
   err=$(ffmpeg -nostdin -hide_banner -loglevel error -y \
-        -i "$src" -map 0:a -map_metadata 0 \
+        -i "$src" -map 0:a -map_metadata 0 "${META_ARGS[@]}" \
         -c:a "$tgt" -write_id3v2 1 -f aiff "$out" 2>&1) && { ART_DROPPED=1; return 0; }
   CONVERT_ERR="${err//$'\n'/ | }"
   return 1
@@ -225,6 +345,31 @@ process_file() {
   fi
 
   local tgt; tgt=$(target_codec "$bits" "$fmt")
+
+  # Read existing tags + art presence, then compute the fill-gaps-only
+  # enrichment plan (catalog→grouping, track/disc, feat→ft, folder art).
+  # ffprobe prefixes format-tag keys with "TAG:" and a value can itself contain
+  # "=", so match the prefixed key and keep everything after the first "=".
+  local taginfo cur_track cur_disc cur_grouping cur_title has_art
+  taginfo=$(ffprobe -v error -show_entries format_tags=track,disc,grouping,title \
+              -of default=nw=1 -- "$src" 2>/dev/null)
+  _tagval() { print -r -- "$taginfo" | awk -F= -v k="TAG:$1" '$1==k{print substr($0, index($0,"=")+1); exit}'; }
+  cur_track=$(_tagval track)
+  cur_disc=$(_tagval disc)
+  cur_grouping=$(_tagval grouping)
+  cur_title=$(_tagval title)
+  has_art=$(ffprobe -v error -select_streams v -show_entries stream=codec_name \
+              -of default=nw=1:nk=1 -- "$src" 2>/dev/null | grep -q . && print 1 || print 0)
+  build_meta_args "$src" "$cur_track" "$cur_disc" "$cur_grouping" "$cur_title" "$has_art"
+
+  if (( DRYRUN )); then
+    if (( ${#META_PLAN} )); then
+      print -u2 -- "toaiff: would convert ${src:t} ($tgt) [${(j: :)META_PLAN}]"
+    else
+      print -u2 -- "toaiff: would convert ${src:t} ($tgt)"
+    fi
+    (( previewed++ )); return
+  fi
 
   # ffmpeg writes the AIFF DIRECTLY to its final path — no temp file, no rename.
   # A sandboxed Finder Quick Action (run by ShortcutsMacHelper) lets ffmpeg
@@ -289,6 +434,14 @@ if [[ "${1:-}" == "--check-root" ]]; then
   is_forbidden_root "${2:-}" && exit 0 || exit 2
 fi
 
+# Hidden dispatches so the pure enrichment parsers can be unit-tested without an
+# ffmpeg run (mirrors --check-root).
+case "${1:-}" in
+  --detect-catalog)    detect_catalog "${2:-}"; exit 0 ;;
+  --derive-track-disc) derive_track_disc "${2:-}"; exit 0 ;;
+  --normalize-feat)    normalize_feat "${2:-}"; exit 0 ;;
+esac
+
 ensure_tools
 
 log_debug "RUN start: $*"
@@ -296,6 +449,11 @@ log_debug "RUN start: $*"
 for arg in "$@"; do
   process_path "$arg"
 done
+
+if (( DRYRUN )); then
+  print -u2 -- "toaiff: dry run — ${previewed} file(s) would convert, nothing changed"
+  exit 0
+fi
 
 # Human-readable summary goes to stderr, not stdout: a Shortcuts "Run Shell
 # Script" action captures stdout as its output and would otherwise save it as a

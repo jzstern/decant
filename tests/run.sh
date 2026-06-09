@@ -139,6 +139,84 @@ assert_eq   "mixed run lists converted and skipped" \
             "toaiff: 1 converted · 1 skipped" \
             "$(TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" "$S2" 2>&1 >/dev/null | tail -1)"
 
+print -r -- "enrichment: feat. -> ft. normalization (title only, word-anchored)"
+assert_eq   "lowercase feat. -> ft." "Lights Out (ft. Romy)" \
+            "$("$TOAIFF" --normalize-feat 'Lights Out (feat. Romy)')"
+assert_eq   "capital Feat. -> ft." "Track (ft. X)" \
+            "$("$TOAIFF" --normalize-feat 'Track (Feat. X)')"
+assert_eq   "FEISTY untouched (needs literal dot)" "..FEISTY (ft. Bia)" \
+            "$("$TOAIFF" --normalize-feat '..FEISTY (feat. Bia)')"
+assert_eq   "idempotent on already-ft." "A (ft. B)" \
+            "$("$TOAIFF" --normalize-feat 'A (ft. B)')"
+
+print -r -- "enrichment: catalog detection from folder name (uppercased)"
+assert_eq   "[SHA300] bracketed" "SHA300" \
+            "$("$TOAIFF" --detect-catalog '[SHA300] VA - 20 Years Of Shogun Audio [2024]')"
+assert_eq   "(snf137) lowercase -> SNF137" "SNF137" \
+            "$("$TOAIFF" --detect-catalog 'back 2 earth (snf137) (2026) [flac] [24b-44.1khz]')"
+assert_eq   "scene paren (FXPLY025)" "FXPLY025" \
+            "$("$TOAIFF" --detect-catalog 'Kassian-Grain__Shell_Dub-(FXPLY025)-WEB-2026-PTC')"
+assert_eq   "bare scene token USB002" "USB002" \
+            "$("$TOAIFF" --detect-catalog 'Fred again.. - USB002 - [2025]')"
+assert_eq   "{LLR004} curly braces" "LLR004" \
+            "$("$TOAIFF" --detect-catalog 'a.s.o. - a.s.o. remixed (2023) [FLAC] {LLR004}')"
+assert_eq   "trailing letters NB011EP" "NB011EP" \
+            "$("$TOAIFF" --detect-catalog 'VA - Various Artists, Vol. 2 [NB011EP]')"
+assert_eq   "decoy [FLAC 24] -> none" "" \
+            "$("$TOAIFF" --detect-catalog 'CHASING LIGHT (2026) [FLAC 24]')"
+assert_eq   "decoy year/format only -> none" "" \
+            "$("$TOAIFF" --detect-catalog 'Gallows ep (2022) [WEB FLAC]')"
+assert_eq   "barcode in braces -> none" "" \
+            "$("$TOAIFF" --detect-catalog 'OPN - Tranquilizer (2025) [FLAC] {Warp Records, 5056818805226}')"
+
+print -r -- "enrichment: track/disc from leading filename token only"
+assert_eq   "NN - Title -> track" "track=1" \
+            "$("$TOAIFF" --derive-track-disc '01 - Adrift.flac')"
+assert_eq   "NNN - Artist - Title -> track" "track=3" \
+            "$("$TOAIFF" --derive-track-disc '003 - DJ Q - I Couldnt See.flac')"
+assert_eq   "(disc - track) form" "disc=1 track=2" \
+            "$("$TOAIFF" --derive-track-disc '(01 - 02) Bangarang.aiff')"
+assert_eq   "trailing year in title ignored" "track=1" \
+            "$("$TOAIFF" --derive-track-disc '01 - 1983.aiff')"
+assert_eq   "no leading number -> nothing" "" \
+            "$("$TOAIFF" --derive-track-disc '# Dr. Derg - Depression.flac')"
+
+print -r -- "enrichment: end-to-end tagging (catalog folder + feat + folder art)"
+EN="$WORK/[ARTKL081] Cadik - Lion Soul (2025)"; mkdir -p "$EN"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=1" \
+  -sample_fmt s32 -bits_per_raw_sample 24 -c:a flac \
+  -metadata title="Lion Soul (feat. Someone)" "$EN/02 - Lion Soul (feat. Someone).flac"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "color=c=blue:s=48x48:d=1" -frames:v 1 "$EN/cover.png"
+# A sibling that already has track=7 — fill-gaps-only must not overwrite it.
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=330:duration=1" \
+  -c:a flac -metadata track=7 -metadata title="Preset" "$EN/05 - Preset.flac"
+TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" "$EN" >/dev/null 2>&1
+ENA="$EN/02 - Lion Soul (feat. Someone).aiff"
+ENB="$EN/05 - Preset.aiff"
+assert_eq   "catalog -> grouping (uppercased)" "ARTKL081" \
+            "$(probe -show_entries format_tags=grouping -of default=nw=1:nk=1 -- "$ENA")"
+assert_eq   "track backfilled from filename" "2" \
+            "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$ENA")"
+assert_eq   "feat. normalized in title" "Lion Soul (ft. Someone)" \
+            "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$ENA")"
+assert_eq   "folder art embedded when source has none" "png" \
+            "$(probe -select_streams v -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$ENA")"
+assert_eq   "audio depth still preserved alongside enrichment" "pcm_s24be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$ENA")"
+assert_eq   "existing track tag is NOT overwritten (fill-gaps-only)" "7" \
+            "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$ENB")"
+
+print -r -- "enrichment: --dry-run changes nothing"
+DR="$WORK/dryrun"; mkdir -p "$DR"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=460:duration=1" -c:a flac "$DR/01 - Tone.flac"
+DROUT="$(TOAIFF_LOG="$LOG" "$TOAIFF" --dry-run "$DR" 2>&1)"
+assert_true "dry-run writes no .aiff" \
+            test ! -f "$DR/01 - Tone.aiff"
+assert_true "dry-run leaves the original in place" \
+            test -f "$DR/01 - Tone.flac"
+assert_true "dry-run reports the would-convert plan" \
+            grep -q "would convert" <<< "$DROUT"
+
 print -r -- "safety: forbidden-root guard (checked without scanning)"
 "$TOAIFF" --check-root "/" >/dev/null 2>&1
 assert_eq   "refuses /" "0" "$?"
