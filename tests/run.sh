@@ -217,6 +217,28 @@ assert_true "dry-run leaves the original in place" \
 assert_true "dry-run reports the would-convert plan" \
             grep -q "would convert" <<< "$DROUT"
 
+print -r -- "--version prints the version and exits 0"
+assert_true "version string looks like 'toaiff N.N.N'" \
+            grep -qE '^toaiff [0-9]+\.[0-9]+\.[0-9]+$' <<< "$("$TOAIFF" --version)"
+
+print -r -- "--no-enrich does a pure transcode (no derived/normalized tags)"
+NE="$WORK/[ARTKL099] NoEnrich Test"; mkdir -p "$NE"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=1" \
+  -sample_fmt s32 -bits_per_raw_sample 24 -c:a flac \
+  -metadata title="Lion Soul (feat. Someone)" "$NE/02 - Lion Soul (feat. Someone).flac"
+TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" --no-enrich "$NE" >/dev/null 2>&1
+NEA="$NE/02 - Lion Soul (feat. Someone).aiff"
+assert_eq   "no catalog grouping written under --no-enrich" "" \
+            "$(probe -show_entries format_tags=grouping -of default=nw=1:nk=1 -- "$NEA")"
+assert_eq   "no track backfilled under --no-enrich" "" \
+            "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$NEA")"
+assert_eq   "title untouched (feat. NOT normalized) under --no-enrich" "Lion Soul (feat. Someone)" \
+            "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$NEA")"
+assert_eq   "audio bit depth still preserved under --no-enrich" "pcm_s24be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$NEA")"
+assert_true "TOAIFF_NO_ENRICH env matches the flag (dry-run shows no plan)" \
+            test -z "$(TOAIFF_NO_ENRICH=1 TOAIFF_LOG="$LOG" "$TOAIFF" --dry-run "$NE" 2>&1 | grep 'grouping=')"
+
 print -r -- "quick action: --notify with no TTY writes nothing to stdout/stderr"
 QA="$WORK/qa"; mkdir -p "$QA"
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=450:duration=1" -c:a flac "$QA/01 - Tone.flac"
