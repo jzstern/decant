@@ -217,6 +217,19 @@ assert_true "dry-run leaves the original in place" \
 assert_true "dry-run reports the would-convert plan" \
             grep -q "would convert" <<< "$DROUT"
 
+print -r -- "quick action: --notify with no TTY writes nothing to stdout/stderr"
+QA="$WORK/qa"; mkdir -p "$QA"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=450:duration=1" -c:a flac "$QA/01 - Tone.flac"
+# $(...) gives the script a non-TTY stdout/stderr, exactly like the Finder Quick
+# Action's captured streams (which otherwise become a stray stdout/stderr.txt).
+QAOUT="$(TOAIFF_KEEP_ORIGINALS=1 TOAIFF_NO_NOTIFY=1 TOAIFF_LOG="$LOG" "$TOAIFF" --notify "$QA" 2>&1)"
+assert_eq   "no captured output under --notify (no stray stdout/stderr.txt)" \
+            "" "$QAOUT"
+assert_true "conversion still happens silently under --notify" \
+            test -f "$QA/01 - Tone.aiff"
+assert_true "interactive run (no --notify) still prints its summary" \
+            grep -q "toaiff:" <<< "$(TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" "$WORK/s1" 2>&1)"
+
 print -r -- "safety: forbidden-root guard (checked without scanning)"
 "$TOAIFF" --check-root "/" >/dev/null 2>&1
 assert_eq   "refuses /" "0" "$?"
