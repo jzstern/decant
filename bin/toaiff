@@ -112,24 +112,43 @@ trash_original() {
   mv -f -- "$abs" "$HOME/.Trash/" 2>/dev/null
 }
 
+# A produced file counts as a valid AIFF only if ffprobe can read an audio
+# stream from it — guards against trashing the original when ffmpeg exited 0
+# but wrote something unplayable.
+valid_aiff() {
+  ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
+    -of default=nw=1:nk=1 -- "$1" 2>/dev/null | grep -q .
+}
+
+# Best-effort removal of a failed/partial output. ffmpeg created it, so a plain
+# rm can be denied inside a protected folder; fall back to NSFileManager trash.
+discard_output() {
+  local f="$1"
+  [[ -e "$f" ]] || return 0
+  rm -f -- "$f" 2>/dev/null && return 0
+  /usr/bin/osascript -l JavaScript \
+    -e 'ObjC.import("Foundation");' \
+    -e 'function run(a){var fm=$.NSFileManager.defaultManager;var u=$.NSURL.fileURLWithPath(a[0]);fm.trashItemAtURLResultingItemURLError(u,null,null);return "";}' \
+    "${f:A}" >/dev/null 2>&1
+}
+
 # Sets CONVERT_ERR on total failure and ART_DROPPED when the art-preserving
-# attempt fails but the audio-only fallback succeeds.
+# attempt fails but the audio-only fallback succeeds. Writes straight to "$out".
 convert_file() {
-  local src="$1" tgt="$2" tmp="$3"
+  local src="$1" tgt="$2" out="$3"
   CONVERT_ERR=""
   ART_DROPPED=0
-  # -f aiff is explicit because the temp file is a dot-file with no .aiff suffix.
   # First attempt keeps every stream (audio + embedded cover art).
   if ffmpeg -nostdin -hide_banner -loglevel error -y \
         -i "$src" -map 0 -map_metadata 0 \
-        -c:a "$tgt" -c:v copy -write_id3v2 1 -f aiff "$tmp" 2>/dev/null; then
+        -c:a "$tgt" -c:v copy -write_id3v2 1 -f aiff "$out" 2>/dev/null; then
     return 0
   fi
   # Fallback: audio + metadata only (drops art the AIFF muxer rejected).
   local err
   err=$(ffmpeg -nostdin -hide_banner -loglevel error -y \
         -i "$src" -map 0:a -map_metadata 0 \
-        -c:a "$tgt" -write_id3v2 1 -f aiff "$tmp" 2>&1) && { ART_DROPPED=1; return 0; }
+        -c:a "$tgt" -write_id3v2 1 -f aiff "$out" 2>&1) && { ART_DROPPED=1; return 0; }
   CONVERT_ERR="${err//$'\n'/ | }"
   return 1
 }
@@ -184,17 +203,16 @@ process_file() {
   fi
 
   local tgt; tgt=$(target_codec "$bits" "$fmt")
-  # Hidden dot-file temp so iCloud/Finder don't sync or display a stray .aiff.
-  local tmp="${dest:h}/.${dest:t:r}.toaiff-partial"
-  rm -f -- "$tmp" 2>/dev/null
 
-  # Order matters for safety: the original is only trashed AFTER the final file
-  # is verified in place, so a failed move never loses the source.
-  local mv_err=""
-  if convert_file "$src" "$tgt" "$tmp" && [[ -s "$tmp" ]] \
-       && { mv_err=$(mv -f -- "$tmp" "$dest" 2>&1); [[ -s "$dest" ]]; }; then
+  # ffmpeg writes the AIFF DIRECTLY to its final path — no temp file, no rename.
+  # A sandboxed Finder Quick Action (run by ShortcutsMacHelper) lets ffmpeg
+  # CREATE files even inside TCC-protected folders, but the shell may NOT
+  # rename/delete a file a child process (ffmpeg) created — which is why the
+  # old "ffmpeg → temp, shell mv → dest" approach failed in Downloads/Desktop/
+  # Documents. The original is trashed only after the output is verified valid.
+  if convert_file "$src" "$tgt" "$dest" && [[ -s "$dest" ]] && valid_aiff "$dest"; then
     trash_original "$src"
-    print -r -- "toaiff: converted ${src:t} → ${dest:t} ($tgt)"
+    print -u2 -- "toaiff: converted ${src:t} → ${dest:t} ($tgt)"
     if (( ART_DROPPED )); then
       print -u2 "toaiff: note: dropped unembeddable artwork for ${src:t}"
       log_line "CONVERTED (artwork dropped) $src -> $dest [$tgt]"
@@ -203,9 +221,9 @@ process_file() {
     fi
     (( converted++ ))
   else
-    rm -f -- "$tmp" 2>/dev/null
+    discard_output "$dest"
     print -u2 "toaiff: FAILED ${src:t}"
-    log_line "FAILED $src [$tgt] :: ${CONVERT_ERR:-${mv_err:-unknown error}}"
+    log_line "FAILED $src [$tgt] :: ${CONVERT_ERR:-unknown error}"
     (( failed++ ))
   fi
 }
@@ -257,8 +275,10 @@ for arg in "$@"; do
   process_path "$arg"
 done
 
-summary="toaiff: ${converted} converted, ${skipped} skipped, ${failed} failed"
-print -r -- "$summary"
+# Human-readable summary goes to stderr, not stdout: a Shortcuts "Run Shell
+# Script" action captures stdout as its output and would otherwise save it as a
+# stray "stdout.txt" next to the converted files.
+print -u2 -- "toaiff: ${converted} converted, ${skipped} skipped, ${failed} failed"
 log_line "RUN done: ${converted} converted, ${skipped} skipped, ${failed} failed"
 
 if (( NOTIFY )); then
