@@ -18,23 +18,35 @@ setopt pipefail extended_glob
 path=(/opt/homebrew/bin /usr/local/bin $path)
 
 NOTIFY=0
-if [[ "${1:-}" == "--notify" ]]; then
-  NOTIFY=1
-  shift
-fi
+DEBUG=0
+[[ -n "${TOAIFF_DEBUG:-}" ]] && DEBUG=1
+while true; do
+  case "${1:-}" in
+    --notify) NOTIFY=1; shift ;;
+    --debug)  DEBUG=1; shift ;;
+    *) break ;;
+  esac
+done
 
 if (( $# == 0 )); then
-  print -u2 "usage: toaiff [--notify] PATH [PATH ...]"
+  print -u2 "usage: toaiff [--notify] [--debug] PATH [PATH ...]"
   exit 64
 fi
 
 typeset -i converted=0 skipped=0 failed=0
 
+# One central, always-appended log regardless of where the action is run from.
+# (TOAIFF_LOG only overrides the path for the test suite.)
 LOG_FILE="${TOAIFF_LOG:-$HOME/Library/Logs/toaiff.log}"
 mkdir -p "${LOG_FILE:h}" 2>/dev/null
 
+# Errors (FAILED / REFUSED) are logged always. Everything else (per-file
+# conversions, skips, run markers) is logged only with --debug / TOAIFF_DEBUG.
 log_line() {
   print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE" 2>/dev/null
+}
+log_debug() {
+  (( DEBUG )) && log_line "$1"
 }
 
 # Concise user-facing summary: only mention the categories that actually
@@ -186,12 +198,12 @@ process_file() {
   [[ -z "$codec" ]] && return
 
   if [[ "$ext" == (aiff|aif|aifc) && "$codec" == pcm_* ]]; then
-    log_line "SKIP (already aiff) $src"
+    log_debug "SKIP (already aiff) $src"
     (( skipped++ )); return
   fi
 
   if ! is_lossless "$codec"; then
-    log_line "SKIP (lossy/unsupported: $codec) $src"
+    log_debug "SKIP (lossy/unsupported: $codec) $src"
     (( skipped++ )); return
   fi
 
@@ -201,14 +213,14 @@ process_file() {
   # Truncated/corrupt file: ffprobe guessed the codec from the extension but
   # cannot determine a sample format. Skip rather than fail the whole run.
   if [[ -z "$fmt" || "$fmt" == "unknown" ]]; then
-    log_line "SKIP (unreadable audio) $src"
+    log_debug "SKIP (unreadable audio) $src"
     (( skipped++ )); return
   fi
 
   local dest="${src:r}.aiff"
   if [[ -e "$dest" && "${dest:A}" != "${src:A}" ]]; then
     print -u2 "toaiff: skip ${src:t} — ${dest:t} already exists"
-    log_line "SKIP (target exists) $src"
+    log_debug "SKIP (target exists) $src"
     (( skipped++ )); return
   fi
 
@@ -225,9 +237,9 @@ process_file() {
     print -u2 -- "toaiff: converted ${src:t} → ${dest:t} ($tgt)"
     if (( ART_DROPPED )); then
       print -u2 "toaiff: note: dropped unembeddable artwork for ${src:t}"
-      log_line "CONVERTED (artwork dropped) $src -> $dest [$tgt]"
+      log_debug "CONVERTED (artwork dropped) $src -> $dest [$tgt]"
     else
-      log_line "CONVERTED $src -> $dest [$tgt]"
+      log_debug "CONVERTED $src -> $dest [$tgt]"
     fi
     (( converted++ ))
   else
@@ -279,7 +291,7 @@ fi
 
 ensure_tools
 
-log_line "RUN start: $*"
+log_debug "RUN start: $*"
 
 for arg in "$@"; do
   process_path "$arg"
@@ -290,7 +302,7 @@ done
 # stray "stdout.txt" next to the converted files. The log keeps the full triple
 # for debugging; the user-facing summary/notification stays concise.
 print -u2 -- "toaiff: $(summary_line)"
-log_line "RUN done: ${converted} converted, ${skipped} skipped, ${failed} failed"
+log_debug "RUN done: ${converted} converted, ${skipped} skipped, ${failed} failed"
 
 if (( NOTIFY )); then
   /usr/bin/osascript \

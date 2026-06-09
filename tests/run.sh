@@ -60,7 +60,8 @@ print -r -- "not audio" > "$WORK/readme.txt"
 print -r -- "frame a = b + c" > "$WORK/notes.al"
 
 # #when the whole tree is converted (recursively, keeping originals)
-TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" "$WORK" >/dev/null
+# (TOAIFF_DEBUG so the verbose CONVERTED/SKIP lines are logged for assertions)
+TOAIFF_KEEP_ORIGINALS=1 TOAIFF_DEBUG=1 TOAIFF_LOG="$LOG" "$TOAIFF" "$WORK" >/dev/null
 typeset -i run_rc=$?
 
 print -r -- "24-bit FLAC → AIFF"
@@ -106,8 +107,23 @@ assert_true "originals are preserved when TOAIFF_KEEP_ORIGINALS is set" \
             test -f "$WORK/album24.flac"
 assert_true "a CONVERTED entry is written to the log" \
             grep -q "CONVERTED .*album24.flac" "$LOG"
-assert_true "a lossy SKIP reason is written to the log" \
+assert_true "a lossy SKIP reason is written to the log (debug run)" \
             grep -q "SKIP (lossy/unsupported: mp3)" "$LOG"
+
+print -r -- "logging: errors-only by default, verbose with --debug"
+DD="$WORK/dlog"; mkdir -p "$DD"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=470:duration=1" -c:a flac "$DD/clean1.flac"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=471:duration=1" -c:a flac "$DD/clean2.flac"
+DLOG="$WORK/d.log"
+: > "$DLOG"; TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$DLOG" "$TOAIFF" "$DD/clean1.flac" >/dev/null 2>&1
+assert_true "a clean run writes nothing to the log by default" \
+            test ! -s "$DLOG"
+: > "$DLOG"; TOAIFF_KEEP_ORIGINALS=1 TOAIFF_DEBUG=1 TOAIFF_LOG="$DLOG" "$TOAIFF" "$DD/clean2.flac" >/dev/null 2>&1
+assert_true "--debug logs the conversion" \
+            grep -q "CONVERTED" "$DLOG"
+: > "$DLOG"; TOAIFF_LOG="$DLOG" "$TOAIFF" "/" >/dev/null 2>&1
+assert_true "errors are logged even without --debug (REFUSED)" \
+            grep -q "REFUSED" "$DLOG"
 
 print -r -- "concise summary (only the categories that occurred)"
 S1="$WORK/s1"; mkdir -p "$S1"

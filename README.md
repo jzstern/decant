@@ -95,26 +95,32 @@ artwork is dropped with a logged note.
 
 ## Safety
 
-The `.aiff` is written to a temporary file first. The original is only trashed
-after ffmpeg succeeds and the output is verified non-empty; on any failure the
-original is left exactly as it was.
+ffmpeg writes the `.aiff` directly to its final path, and the original is
+trashed only after the output is verified to be a readable AIFF (via ffprobe).
+On any failure the original is left exactly as it was.
 
 ## Logging
 
-Every run appends to `~/Library/Logs/toaiff.log` — one line per converted,
-skipped, or failed file, plus the underlying ffmpeg error on failure. This
-matters most for the Finder Quick Action, which otherwise discards all output:
+One central log at **`~/Library/Logs/toaiff.log`**, appended to no matter where
+the action runs. **By default only errors are logged** (a failed conversion or a
+refused-too-broad path), so a clean run writes nothing. For a full trace of
+every run / conversion / skip, enable debug:
 
 ```sh
+toaiff --debug ~/Music/Album        # or set TOAIFF_DEBUG=1
 tail -f ~/Library/Logs/toaiff.log
 ```
+
+To debug the Finder Quick Action, add `--debug` to its Run Shell Script line
+temporarily: `"$HOME/.local/bin/toaiff" --notify --debug "$@"`.
 
 ## Environment variables
 
 | Variable | Effect |
 |----------|--------|
+| `TOAIFF_DEBUG` | Log every run/conversion/skip, not just errors (same as `--debug`). |
 | `TOAIFF_KEEP_ORIGINALS` | Convert without trashing originals (cautious first pass / testing). |
-| `TOAIFF_LOG` | Override the log file path. |
+| `TOAIFF_LOG` | Override the log file path (used by the test suite). |
 
 ## Tests
 
