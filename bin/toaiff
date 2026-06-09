@@ -23,6 +23,17 @@ if [[ "${1:-}" == "--notify" ]]; then
   shift
 fi
 
+# Fallback for a Shortcuts "Run Shell Script" action set to pass input "to stdin"
+# instead of "as arguments": read newline-separated paths from stdin. Only paths
+# that actually exist are accepted, so piped file *contents* are ignored safely.
+if (( $# == 0 )) && [[ ! -t 0 ]]; then
+  typeset -a stdin_paths
+  while IFS= read -r _line; do
+    [[ -n "$_line" && -e "$_line" ]] && stdin_paths+=("$_line")
+  done
+  (( ${#stdin_paths} )) && set -- "${stdin_paths[@]}"
+fi
+
 if (( $# == 0 )); then
   print -u2 "usage: toaiff [--notify] PATH [PATH ...]"
   exit 64

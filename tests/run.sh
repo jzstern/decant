@@ -104,6 +104,13 @@ assert_true "a CONVERTED entry is written to the log" \
 assert_true "a lossy SKIP reason is written to the log" \
             grep -q "SKIP (lossy/unsupported: mp3)" "$LOG"
 
+print -r -- "stdin path input (Shortcuts 'to stdin' fallback)"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=480:duration=1" \
+  -sample_fmt s32 -bits_per_raw_sample 24 -c:a flac "$WORK/stdintest.flac"
+print -r -- "$WORK/stdintest.flac" | TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" >/dev/null
+assert_true "converts a path piped on stdin (no arguments)" \
+            test -f "$WORK/stdintest.aiff"
+
 rm -rf "$WORK"
 
 print -r -- ""
