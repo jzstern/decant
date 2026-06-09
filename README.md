@@ -5,6 +5,11 @@ preserving all available artwork and metadata. Works on a single file or a
 folder (recursing into every subfolder). Lossy and non-audio files are left
 untouched. Each original is moved to the **Trash** once its `.aiff` is written.
 
+It also **enriches** the ID3 tags during conversion — backfilling a catalog
+number, track/disc numbers, and folder artwork from the file/folder names, and
+normalizing `feat.`→`ft.` — without ever overwriting tags the source already
+has. See [Metadata enrichment](#metadata-enrichment).
+
 Runs as a CLI, plus a one-time **Shortcuts** Quick Action for right-clicking in
 Finder.
 
@@ -22,6 +27,7 @@ via Homebrew on first run if it isn't already present.
 ```sh
 toaiff ~/Music/Album            # recurse a folder
 toaiff track.flac other.wav     # one or more files
+toaiff --dry-run ~/Music/Album  # preview tags/conversions, write nothing
 ```
 
 ## Finder Quick Action
@@ -92,6 +98,32 @@ Sample rate and channel layout are never touched (no resampling). Tags and
 embedded cover art are carried over via `-map_metadata` and an ID3v2 chunk; if
 the AIFF container rejects an embedded image, the audio still converts and the
 artwork is dropped with a logged note.
+
+## Metadata enrichment
+
+During conversion, `toaiff` derives tags that live in the file/folder names but
+are missing from the audio tags, and applies one normalization. Everything is
+**fill-gaps-only** — an existing tag is never overwritten — and enrichment is
+**on by default** for every conversion, including the Finder Quick Action.
+
+| Enrichment | Source | Written to | Rule |
+|------------|--------|-----------|------|
+| **Catalog number** | album folder name, e.g. `[SHA300]`, `(snf137)`, `{LLR004}`, bare `USB002` | `grouping` (uppercased, e.g. `SHA300`) | only if no `grouping` tag |
+| **Track / disc** | leading filename token: `01 - …`, `001 - …`, `(01 - 02) …` | `track` / `disc` | only the leading number; trailing numbers in a title are ignored; only if absent |
+| **`feat.`→`ft.`** | the `title` itself | `title` | word-anchored (so `FEISTY` is safe); the one value that is *edited*, not gap-filled |
+| **Folder artwork** | `cover`/`folder`/`front`.`jpg`/`png` beside the file | embedded cover | only if the source has no embedded art |
+
+Catalog detection rejects look-alikes in the same brackets — format/quality
+words (`[WEB FLAC]`, `[FLAC 24]`), years (`(2026)`), release types (`[EP]`), and
+barcodes (`{…, 5056818805226}`). Validated against a 7,988-folder library:
+~5,500 real catalog numbers detected with a single false positive.
+
+Use **`--dry-run`** to preview exactly what each file would get before writing:
+
+```sh
+toaiff --dry-run ~/Music/Album
+# toaiff: would convert 02 - Lion Soul (feat. X).flac (pcm_s24be) [grouping=ARTKL081 track=2 title=Lion Soul (ft. X) art=cover.png]
+```
 
 ## Safety
 
