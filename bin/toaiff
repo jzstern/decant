@@ -7,10 +7,13 @@
 # is moved to the Trash once its .aiff is written successfully.
 #
 # Usage:
-#   toaiff [--notify] PATH [PATH ...]
+#   toaiff [--notify] [--debug] [--dry-run] [--no-enrich] PATH [PATH ...]
+#   toaiff --version
 
 emulate -L zsh
 setopt pipefail extended_glob
+
+TOAIFF_VERSION="0.1.0"
 
 # GUI-launched processes (Finder Quick Action / Automator) inherit a minimal
 # PATH that omits Homebrew, so ffmpeg/ffprobe/brew would be invisible. Make the
@@ -20,18 +23,23 @@ path=(/opt/homebrew/bin /usr/local/bin $path)
 NOTIFY=0
 DEBUG=0
 DRYRUN=0
+ENRICH=1
 [[ -n "${TOAIFF_DEBUG:-}" ]] && DEBUG=1
+[[ -n "${TOAIFF_NO_ENRICH:-}" ]] && ENRICH=0
 while true; do
   case "${1:-}" in
-    --notify)  NOTIFY=1; shift ;;
-    --debug)   DEBUG=1; shift ;;
-    --dry-run) DRYRUN=1; shift ;;
+    --notify)    NOTIFY=1; shift ;;
+    --debug)     DEBUG=1; shift ;;
+    --dry-run)   DRYRUN=1; shift ;;
+    --no-enrich) ENRICH=0; shift ;;
+    --version)   print -r -- "toaiff $TOAIFF_VERSION"; exit 0 ;;
     *) break ;;
   esac
 done
 
 if (( $# == 0 )); then
-  print -u2 "usage: toaiff [--notify] [--debug] [--dry-run] PATH [PATH ...]"
+  print -u2 "usage: toaiff [--notify] [--debug] [--dry-run] [--no-enrich] PATH [PATH ...]"
+  print -u2 "       toaiff --version"
   exit 64
 fi
 
@@ -348,19 +356,23 @@ process_file() {
 
   # Read existing tags + art presence, then compute the fill-gaps-only
   # enrichment plan (catalog→grouping, track/disc, feat→ft, folder art).
-  # ffprobe prefixes format-tag keys with "TAG:" and a value can itself contain
-  # "=", so match the prefixed key and keep everything after the first "=".
-  local taginfo cur_track cur_disc cur_grouping cur_title has_art
-  taginfo=$(ffprobe -v error -show_entries format_tags=track,disc,grouping,title \
-              -of default=nw=1 -- "$src" 2>/dev/null)
-  _tagval() { print -r -- "$taginfo" | awk -F= -v k="TAG:$1" '$1==k{print substr($0, index($0,"=")+1); exit}'; }
-  cur_track=$(_tagval track)
-  cur_disc=$(_tagval disc)
-  cur_grouping=$(_tagval grouping)
-  cur_title=$(_tagval title)
-  has_art=$(ffprobe -v error -select_streams v -show_entries stream=codec_name \
-              -of default=nw=1:nk=1 -- "$src" 2>/dev/null | grep -q . && print 1 || print 0)
-  build_meta_args "$src" "$cur_track" "$cur_disc" "$cur_grouping" "$cur_title" "$has_art"
+  # Skipped entirely under --no-enrich / TOAIFF_NO_ENRICH (pure transcode).
+  META_ARGS=(); META_PLAN=(); ART_INPUT=""
+  if (( ENRICH )); then
+    # ffprobe prefixes format-tag keys with "TAG:" and a value can itself contain
+    # "=", so match the prefixed key and keep everything after the first "=".
+    local taginfo cur_track cur_disc cur_grouping cur_title has_art
+    taginfo=$(ffprobe -v error -show_entries format_tags=track,disc,grouping,title \
+                -of default=nw=1 -- "$src" 2>/dev/null)
+    _tagval() { print -r -- "$taginfo" | awk -F= -v k="TAG:$1" '$1==k{print substr($0, index($0,"=")+1); exit}'; }
+    cur_track=$(_tagval track)
+    cur_disc=$(_tagval disc)
+    cur_grouping=$(_tagval grouping)
+    cur_title=$(_tagval title)
+    has_art=$(ffprobe -v error -select_streams v -show_entries stream=codec_name \
+                -of default=nw=1:nk=1 -- "$src" 2>/dev/null | grep -q . && print 1 || print 0)
+    build_meta_args "$src" "$cur_track" "$cur_disc" "$cur_grouping" "$cur_title" "$has_art"
+  fi
 
   if (( DRYRUN )); then
     if (( ${#META_PLAN} )); then
