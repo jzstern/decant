@@ -37,6 +37,16 @@ log_line() {
   print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE" 2>/dev/null
 }
 
+# Concise user-facing summary: only mention the categories that actually
+# occurred. e.g. all-success → "3 converted"; mixed → "3 converted · 1 skipped".
+summary_line() {
+  local parts=()
+  (( converted )) && parts+=("${converted} converted")
+  (( skipped ))   && parts+=("${skipped} skipped")
+  (( failed ))    && parts+=("${failed} failed")
+  (( ${#parts} )) && print -r -- "${(j: · :)parts}" || print -r -- "no audio files to convert"
+}
+
 ensure_tools() {
   if (( $+commands[ffmpeg] && $+commands[ffprobe] )); then
     return 0
@@ -277,8 +287,9 @@ done
 
 # Human-readable summary goes to stderr, not stdout: a Shortcuts "Run Shell
 # Script" action captures stdout as its output and would otherwise save it as a
-# stray "stdout.txt" next to the converted files.
-print -u2 -- "toaiff: ${converted} converted, ${skipped} skipped, ${failed} failed"
+# stray "stdout.txt" next to the converted files. The log keeps the full triple
+# for debugging; the user-facing summary/notification stays concise.
+print -u2 -- "toaiff: $(summary_line)"
 log_line "RUN done: ${converted} converted, ${skipped} skipped, ${failed} failed"
 
 if (( NOTIFY )); then
@@ -286,7 +297,7 @@ if (( NOTIFY )); then
     -e 'on run argv' \
     -e 'display notification (item 1 of argv) with title "Convert to AIFF"' \
     -e 'end run' \
-    "${converted} converted · ${skipped} skipped · ${failed} failed" >/dev/null 2>&1
+    "$(summary_line)" >/dev/null 2>&1
 fi
 
 (( failed == 0 ))

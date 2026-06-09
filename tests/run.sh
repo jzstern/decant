@@ -109,6 +109,20 @@ assert_true "a CONVERTED entry is written to the log" \
 assert_true "a lossy SKIP reason is written to the log" \
             grep -q "SKIP (lossy/unsupported: mp3)" "$LOG"
 
+print -r -- "concise summary (only the categories that occurred)"
+S1="$WORK/s1"; mkdir -p "$S1"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=1" -c:a flac "$S1/a.flac"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=441:duration=1" -c:a flac "$S1/b.flac"
+assert_eq   "all-success shows only the converted count" \
+            "toaiff: 2 converted" \
+            "$(TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" "$S1" 2>&1 >/dev/null | tail -1)"
+S2="$WORK/s2"; mkdir -p "$S2"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=442:duration=1" -c:a flac "$S2/a.flac"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=443:duration=1" -c:a libmp3lame "$S2/b.mp3"
+assert_eq   "mixed run lists converted and skipped" \
+            "toaiff: 1 converted · 1 skipped" \
+            "$(TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" "$S2" 2>&1 >/dev/null | tail -1)"
+
 print -r -- "safety: forbidden-root guard (checked without scanning)"
 "$TOAIFF" --check-root "/" >/dev/null 2>&1
 assert_eq   "refuses /" "0" "$?"
