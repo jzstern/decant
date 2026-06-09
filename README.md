@@ -28,18 +28,27 @@ toaiff track.flac other.wav     # one or more files
 
 On macOS Sequoia/Tahoe, a true Finder **Quick Action** must be a Shortcut or an
 app extension — a hand-built Automator `.workflow` only ever registers as a
-*Service*. So the right-click integration is a Shortcut that calls the CLI. Set
-it up once (~1 minute):
+*Service*. So the right-click integration is a Shortcut that calls the CLI.
 
-1. Open **Shortcuts.app** → **File ▸ New Shortcut** (⌘N).
-2. In the right-hand details panel (ⓘ), tick **Use as Quick Action** and
-   **Finder**. Set **Receive** to **Files and Folders**.
-3. Search the actions list for **Run Shell Script** and drag it in. Configure:
-   - **Shell:** `zsh`
-   - **Pass Input:** **as arguments**
-   - **Script:** `"$HOME/.local/bin/toaiff" --notify "$@"`
-4. Rename the shortcut (top of the window) to **→ aiff**.
-5. Now right-click files/folders in Finder → **Quick Actions → → aiff**.
+**Install the ready-made one:**
+
+1. Double-click [`shortcut/→ aiff.shortcut`](shortcut/) → **Add Shortcut**.
+   (It's pre-built: receives Files and Folders, runs the CLI, passes input
+   **as arguments**, and is flagged as a Finder Quick Action.)
+2. **Enable it** — macOS imports Shortcut Quick Actions *disabled*. Turn it on
+   in **System Settings ▸ Login Items & Extensions ▸ Finder** → toggle **→ aiff**
+   on. *(This step is easy to miss; without it the action won't appear.)*
+3. Right-click any FLAC/WAV files or a folder in Finder →
+   **Quick Actions ▸ → aiff**.
+4. **First run only:** macOS asks to let the shortcut access the file(s) and
+   output text — click **Always Allow** on each. Silent thereafter.
+
+To rebuild the signed shortcut from source:
+
+```sh
+cd shortcut && cp toaiff.shortcut.plist in.shortcut \
+  && shortcuts sign --mode anyone -i in.shortcut -o "→ aiff.shortcut" && rm in.shortcut
+```
 
 > **Protected folders:** shell scripts launched from Finder are sandboxed and
 > can't write inside **Desktop, Documents, and Downloads** unless you grant

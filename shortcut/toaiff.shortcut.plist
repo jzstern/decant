@@ -42,7 +42,7 @@
 				<key>Shell</key>
 				<string>/bin/zsh</string>
 				<key>InputMode</key>
-				<string>to arguments</string>
+				<string>as arguments</string>
 				<key>Input</key>
 				<dict>
 					<key>Value</key>
