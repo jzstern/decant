@@ -23,17 +23,6 @@ if [[ "${1:-}" == "--notify" ]]; then
   shift
 fi
 
-# Fallback for a Shortcuts "Run Shell Script" action set to pass input "to stdin"
-# instead of "as arguments": read newline-separated paths from stdin. Only paths
-# that actually exist are accepted, so piped file *contents* are ignored safely.
-if (( $# == 0 )) && [[ ! -t 0 ]]; then
-  typeset -a stdin_paths
-  while IFS= read -r _line; do
-    [[ -n "$_line" && -e "$_line" ]] && stdin_paths+=("$_line")
-  done
-  (( ${#stdin_paths} )) && set -- "${stdin_paths[@]}"
-fi
-
 if (( $# == 0 )); then
   print -u2 "usage: toaiff [--notify] PATH [PATH ...]"
   exit 64
@@ -62,6 +51,18 @@ ensure_tools() {
     print -u2 "toaiff: 'brew install ffmpeg' failed."
     exit 69
   fi
+}
+
+# Recognised audio file extensions (lowercased). Anything not in this set is
+# left alone without even probing it, so non-audio files can never be misread
+# as audio. Lossy extensions are included so they get probed and then skipped
+# by codec; non-audio extensions are rejected outright.
+is_audio_ext() {
+  case "$1" in
+    flac|wav|wave|w64|rf64|bwf|aif|aiff|aifc|m4a|m4b|mp4|caf|alac|ape|wv|tak|tta|mlp|thd|shn|dsf|dff) return 0 ;;
+    mp3|aac|ogg|oga|opus|wma|ac3|eac3|dts|mka|aifr) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # A codec name is lossless if it is on the allowlist, or any PCM variant.
@@ -137,6 +138,12 @@ process_file() {
   local src="$1"
   local ext="${src:e:l}"
 
+  # Only consider files with a recognised audio extension. This is a safety net:
+  # without it ffmpeg will happily mis-detect unrelated files (e.g. a `.al` text
+  # file as raw A-law audio) and "convert" them. Extension gate first, codec
+  # check second.
+  is_audio_ext "$ext" || return
+
   # Empty file → skip (treat like a non-audio file, never a failure).
   [[ -s "$src" ]] || return
 
@@ -203,8 +210,26 @@ process_file() {
   fi
 }
 
+# Recursing one of these would scan an enormous tree and trash audio all over
+# the system. Refuse them outright — a real target is always a specific file or
+# album folder, never a filesystem root or a whole home/library directory.
+is_forbidden_root() {
+  local abs="${1:A}"
+  case "$abs" in
+    / | "$HOME" | /Users | /System | /Library | /Applications \
+      | /usr | /sbin | /bin | /etc | /var | /private | /opt | /cores | /Volumes) return 0 ;;
+    /System/* | /usr/*) return 0 ;;
+  esac
+  return 1
+}
+
 process_path() {
   local p="$1"
+  if is_forbidden_root "$p"; then
+    print -u2 "toaiff: refusing to recurse '$p' (too broad — point me at a file or an album folder)"
+    log_line "REFUSED (forbidden root) $p"
+    return
+  fi
   if [[ -d "$p" ]]; then
     local file
     while IFS= read -r -d '' file; do
@@ -216,6 +241,13 @@ process_path() {
     print -u2 "toaiff: not found: $p"
   fi
 }
+
+# Non-destructive diagnostic: `toaiff --check-root PATH` exits 0 if PATH is a
+# forbidden (too-broad) root, 2 if it would be processed. Used by the tests to
+# verify the guard without ever scanning a real root.
+if [[ "${1:-}" == "--check-root" ]]; then
+  is_forbidden_root "${2:-}" && exit 0 || exit 2
+fi
 
 ensure_tools
 

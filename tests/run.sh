@@ -55,6 +55,9 @@ ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=330:dur
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=550:duration=1" -c:a pcm_s16be "$WORK/already.aiff"
 print -r -- "not audio" > "$WORK/readme.txt"
 : > "$WORK/corrupt.flac"   # 0-byte file with a lossless extension
+# A text file whose extension (.al) ffmpeg would otherwise mis-detect as raw
+# A-law audio — must be ignored by the extension gate.
+print -r -- "frame a = b + c" > "$WORK/notes.al"
 
 # #when the whole tree is converted (recursively, keeping originals)
 TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" "$WORK" >/dev/null
@@ -93,6 +96,8 @@ assert_eq   "existing AIFF is left bit-identical (skipped, not re-encoded)" \
             "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$WORK/already.aiff")"
 assert_true "a 0-byte/corrupt .flac is skipped, not failed (no AIFF written)" \
             test ! -f "$WORK/corrupt.aiff"
+assert_true "a non-audio .al file is ignored by the extension gate (no AIFF)" \
+            test ! -f "$WORK/notes.aiff"
 assert_eq   "the run exits 0 even with a corrupt file present" \
             "0" "$run_rc"
 
@@ -104,12 +109,20 @@ assert_true "a CONVERTED entry is written to the log" \
 assert_true "a lossy SKIP reason is written to the log" \
             grep -q "SKIP (lossy/unsupported: mp3)" "$LOG"
 
-print -r -- "stdin path input (Shortcuts 'to stdin' fallback)"
-ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=480:duration=1" \
-  -sample_fmt s32 -bits_per_raw_sample 24 -c:a flac "$WORK/stdintest.flac"
-print -r -- "$WORK/stdintest.flac" | TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" >/dev/null
-assert_true "converts a path piped on stdin (no arguments)" \
-            test -f "$WORK/stdintest.aiff"
+print -r -- "safety: forbidden-root guard (checked without scanning)"
+"$TOAIFF" --check-root "/" >/dev/null 2>&1
+assert_eq   "refuses /" "0" "$?"
+"$TOAIFF" --check-root "$HOME" >/dev/null 2>&1
+assert_eq   "refuses \$HOME" "0" "$?"
+"$TOAIFF" --check-root "/Volumes" >/dev/null 2>&1
+assert_eq   "refuses /Volumes" "0" "$?"
+"$TOAIFF" --check-root "$WORK/sub" >/dev/null 2>&1
+assert_eq   "allows a normal album folder" "2" "$?"
+
+print -r -- "safety: binary on stdin does nothing (no stdin path-guessing)"
+head -c 4096 /dev/urandom | TOAIFF_LOG="$LOG" "$TOAIFF" >/dev/null 2>&1
+assert_eq   "no arguments + binary stdin exits with usage code 64, no scan" \
+            "64" "$?"
 
 rm -rf "$WORK"
 
