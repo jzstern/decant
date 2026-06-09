@@ -50,12 +50,20 @@ cd shortcut && cp toaiff.shortcut.plist in.shortcut \
   && shortcuts sign --mode anyone -i in.shortcut -o "→ aiff.shortcut" && rm in.shortcut
 ```
 
-> **Protected folders:** shell scripts launched from Finder are sandboxed and
-> can't write inside **Desktop, Documents, and Downloads** unless you grant
-> access. To enable those folders, add **Shortcuts** under **System Settings ▸
-> Privacy & Security ▸ Full Disk Access**. Without it, runs there fail safely
-> (the original is left untouched and the error is logged) — everywhere else
-> (`~/Music`, external drives, …) it works out of the box.
+> **Protected folders (Desktop / Documents / Downloads):** shell scripts run
+> from a Shortcut are sandboxed and, in these three TCC-protected folders,
+> macOS blocks the rename that puts the `.aiff` in place. Runs there fail
+> **safely** (original untouched, error logged) until you grant access:
+>
+> 1. Run the action once on a file in Downloads (it'll fail) — this adds
+>    **`siriactionsd`** (the Shortcuts action daemon) to the Full Disk Access
+>    list, disabled.
+> 2. **System Settings ▸ Privacy & Security ▸ Full Disk Access** → toggle
+>    **`siriactionsd`** on (authenticate when prompted).
+> 3. It now works in those folders too. (Restarting helps: `killall siriactionsd`.)
+>
+> Everywhere else (`~/Music`, external drives, …) it works with no Full Disk
+> Access needed.
 
 ## What gets converted
 
