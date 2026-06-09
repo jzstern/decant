@@ -153,6 +153,13 @@ temporarily: `"$HOME/.local/bin/toaiff" --notify --debug "$@"`.
 | `TOAIFF_DEBUG` | Log every run/conversion/skip, not just errors (same as `--debug`). |
 | `TOAIFF_KEEP_ORIGINALS` | Convert without trashing originals (cautious first pass / testing). |
 | `TOAIFF_LOG` | Override the log file path (used by the test suite). |
+| `TOAIFF_NO_NOTIFY` | Suppress the completion notification even with `--notify`. |
+
+> **No stray output files:** as a Finder Quick Action the script runs with
+> `--notify` and no terminal, so it writes nothing to stdout/stderr (which the
+> Shortcuts "Run Shell Script" action would otherwise save as a `stdout.txt` /
+> `stderr.txt` beside your files). Results come from the notification and the
+> log. Run from a terminal, you still get the normal concise summary.
 
 ## Tests
 

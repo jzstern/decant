@@ -444,6 +444,16 @@ esac
 
 ensure_tools
 
+# As a Finder Quick Action, the "Run Shell Script" action captures whatever the
+# script writes to stdout/stderr and materialises a non-empty stream as a stray
+# stdout.txt / stderr.txt next to the files. That context is the only caller
+# that passes --notify and never has a terminal attached, so discard both
+# streams there — feedback comes from the notification and the central log
+# instead. A real terminal (interactive --notify) keeps its output.
+if (( NOTIFY )) && [[ ! -t 2 ]]; then
+  exec >/dev/null 2>&1
+fi
+
 log_debug "RUN start: $*"
 
 for arg in "$@"; do
@@ -455,14 +465,13 @@ if (( DRYRUN )); then
   exit 0
 fi
 
-# Human-readable summary goes to stderr, not stdout: a Shortcuts "Run Shell
-# Script" action captures stdout as its output and would otherwise save it as a
-# stray "stdout.txt" next to the converted files. The log keeps the full triple
-# for debugging; the user-facing summary/notification stays concise.
+# Human-readable summary goes to stderr (discarded entirely in the Quick Action
+# context above, where it would otherwise be captured to a stray file). The log
+# keeps the full triple for debugging; the notification stays concise.
 print -u2 -- "toaiff: $(summary_line)"
 log_debug "RUN done: ${converted} converted, ${skipped} skipped, ${failed} failed"
 
-if (( NOTIFY )); then
+if (( NOTIFY )) && [[ -z "${TOAIFF_NO_NOTIFY:-}" ]]; then
   /usr/bin/osascript \
     -e 'on run argv' \
     -e 'display notification (item 1 of argv) with title "Convert to AIFF"' \
