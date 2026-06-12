@@ -252,6 +252,17 @@ assert_true "conversion still happens silently under --notify" \
 assert_true "interactive run (no --notify) still prints its summary" \
             grep -q "toaiff:" <<< "$(TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" "$WORK/s1" 2>&1)"
 
+# #given the bundled Finder shortcut, which must find the CLI whether it was
+# installed by Homebrew (/opt/homebrew|/usr/local/bin) or install.sh (~/.local/bin)
+print -r -- "quick action shortcut: resolves the CLI regardless of install location"
+PLIST="${0:A:h}/../shortcut/toaiff.shortcut.plist"
+assert_true "shortcut puts Homebrew bin on PATH (works for brew installs)" \
+            grep -q '/opt/homebrew/bin' "$PLIST"
+assert_true "shortcut invokes toaiff via PATH, not a hardcoded path" \
+            grep -q 'exec toaiff --notify' "$PLIST"
+assert_eq   "shortcut no longer hardcodes the ~/.local-only invocation" "0" \
+            "$(grep -c '"$HOME/.local/bin/toaiff" --notify' "$PLIST")"
+
 print -r -- "safety: forbidden-root guard (checked without scanning)"
 "$TOAIFF" --check-root "/" >/dev/null 2>&1
 assert_eq   "refuses /" "0" "$?"
