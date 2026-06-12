@@ -169,7 +169,8 @@ tail -f ~/Library/Logs/toaiff.log
 ```
 
 To debug the Finder Quick Action, add `--debug` to its Run Shell Script line
-temporarily: `"$HOME/.local/bin/toaiff" --notify --debug "$@"`.
+temporarily — change `exec toaiff --notify "$@"` to
+`exec toaiff --notify --debug "$@"`.
 
 ## Configuration
 
