@@ -1660,6 +1660,38 @@ assert_eq   "a file with no tags at all still gets its track backfilled" "6" \
 assert_eq   "…and no title is invented for it" "" \
             "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$SO/06 - Bare.aiff")"
 
+print -r -- "source probe: streams are picked by number, not by hash order"
+# #given thirteen streams, so the ordinals run past 9 — where anything sorting
+# them as text puts stream 11 ahead of stream 2. The first audio stream is the
+# only 24-bit one and the artwork is last, so picking either by the wrong
+# ordinal shows up as a 16-bit AIFF or as missing art.
+MS="$WORK/manystreams"; mkdir -p "$MS"
+art_img "$WORK/_ms.png" red 40
+MSIN=(); MSMAP=()
+for N in {0..11}; do
+  MSIN+=(-f lavfi -i "sine=frequency=$(( 300 + N )):duration=1")
+  MSMAP+=(-map "${N}:a")
+done
+ffmpeg -nostdin -hide_banner -loglevel error "${MSIN[@]}" -i "$WORK/_ms.png" \
+  "${MSMAP[@]}" -map 12:v -c:a flac -sample_fmt:a:0 s32 -bits_per_raw_sample:a:0 24 \
+  -c:v copy -disposition:v attached_pic "$MS/12 - Many.mka"
+rm -f "$WORK/_ms.png"
+assert_eq   "the fixture really does carry thirteen streams" "13" \
+            "$(probe -show_entries stream=index -of default=nw=1:nk=1 -- "$MS/12 - Many.mka" | grep -c .)"
+# pcm_md5 maps every audio stream, which a twelve-stream source would hash all
+# of; the point here is which single stream came through.
+first_pcm_md5() {
+  ffmpeg -nostdin -hide_banner -v error -i "$1" -map 0:a:0 -c:a pcm_s32le -f md5 - 2>/dev/null
+}
+MSMD5="$(first_pcm_md5 "$MS/12 - Many.mka")"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$MS" >/dev/null 2>&1
+assert_eq   "the depth comes from stream 0, not from a later 16-bit one" "pcm_s24be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$MS/12 - Many.aiff")"
+assert_eq   "…and the audio really is the first stream's, bit for bit" \
+            "$MSMD5" "$(pcm_md5 "$MS/12 - Many.aiff")"
+assert_eq   "artwork sitting at stream 12 is still found" "png" \
+            "$(art_codec "$MS/12 - Many.aiff")"
+
 print -r -- "source probe: any video stream counts as art, attached picture or not"
 # #given two sources sitting beside a folder cover: one whose video stream is a
 # real picture-carrying attached_pic, one whose video stream is actual video.
