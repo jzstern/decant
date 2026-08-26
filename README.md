@@ -1,21 +1,24 @@
-# toaiff
+# decant
 
-[![tests](https://github.com/jzstern/toaiff/actions/workflows/tests.yml/badge.svg)](https://github.com/jzstern/toaiff/actions/workflows/tests.yml)
+[![tests](https://github.com/jzstern/decant/actions/workflows/tests.yml/badge.svg)](https://github.com/jzstern/decant/actions/workflows/tests.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
-Right-click lossless audio in Finder and convert it to **AIFF** — no quality
-loss, all artwork and metadata preserved, originals moved to the Trash. Lossy
-`.m4a` (AAC) and `.opus` files convert to **MP3** instead, at the highest
-bitrate that doesn't exceed the source's (never inflated). Works on a single
-file, a selection, or a whole folder (recursing into subfolders). Other lossy
-and non-audio files are left untouched.
+Right-click audio in Finder and pour it into the format your gear actually
+wants — without disturbing what's inside. Lossless files become **AIFF** with
+no quality loss; lossy `.m4a` (AAC) and `.opus` files become CDJ-ready **MP3**
+at the highest bitrate that doesn't exceed the source's (never inflated).
+Metadata is preserved, artwork carries over wherever the target format accepts
+it, and originals move to the Trash. Works on a single file, a selection, or a
+whole folder (recursing into subfolders). Other lossy and non-audio files are
+left untouched.
 
 It also **enriches** the ID3 tags as it converts — backfilling a catalog number,
-track/disc numbers, and folder artwork from the file/folder names, and
-normalizing `feat.`→`ft.` — without ever overwriting tags the source already has.
+track/disc numbers, and folder artwork from the file/folder names. Backfilling
+never overwrites a tag the source already has; the one exception is normalizing
+`feat.`→`ft.`, which edits the title in place.
 
-<!-- TODO: demo.gif — right-click ▸ Quick Actions ▸ → aiff, then the notification -->
+<!-- TODO: demo.gif — right-click ▸ Quick Actions ▸ Decant, then the notification -->
 
 > [!IMPORTANT]
 > Originals are moved to the **Trash** (recoverable), never hard-deleted, and
@@ -33,20 +36,20 @@ normalizing `feat.`→`ft.` — without ever overwriting tags the source already
 ### Homebrew (recommended)
 
 ```sh
-brew install jzstern/tap/toaiff
+brew install jzstern/tap/decant
 ```
 
-This installs the `toaiff` CLI and pulls in `ffmpeg` automatically.
+This installs the `decant` CLI and pulls in `ffmpeg` automatically.
 
 <details>
 <summary>Or install manually from source</summary>
 
 ```sh
-git clone https://github.com/jzstern/toaiff.git
-cd toaiff && ./install.sh
+git clone https://github.com/jzstern/decant.git
+cd decant && ./install.sh
 ```
 
-Copies the CLI to `~/.local/bin/toaiff`. ffmpeg is installed via Homebrew on
+Copies the CLI to `~/.local/bin/decant`. ffmpeg is installed via Homebrew on
 first run if it isn't already present.
 </details>
 
@@ -55,27 +58,39 @@ first run if it isn't already present.
 macOS won't let an installer register a Finder Quick Action — you add the
 bundled Shortcut yourself. It takes about a minute:
 
-1. Double-click [`shortcut/→ aiff.shortcut`](shortcut/) → **Add Shortcut**.
+1. Double-click [`shortcut/Decant.shortcut`](shortcut/) → **Add Shortcut**.
    It's pre-built to receive Files & Folders and run the CLI.
 2. **Enable it.** macOS imports Shortcut Quick Actions *disabled*. Turn it on in
-   **System Settings ▸ Login Items & Extensions ▸ Finder** → toggle **→ aiff** on.
+   **System Settings ▸ Login Items & Extensions ▸ Finder** → toggle **Decant** on.
    *(Easy to miss — without it the action won't appear in the menu.)*
-3. Right-click any lossless files or a folder in Finder →
-   **Quick Actions ▸ → aiff**.
+3. Right-click any audio files or a folder in Finder →
+   **Quick Actions ▸ Decant**.
 4. **First run only:** macOS asks to let the shortcut access the file(s) —
    click **Always Allow**. Silent thereafter.
 
 It works in protected folders (Desktop / Documents / Downloads) with **no Full
 Disk Access needed** — see [How it works](#how-it-works).
 
+### Upgrading from `toaiff`
+
+This tool used to be called `toaiff`, and its Quick Action was named **→ aiff**.
+That shortcut runs `toaiff`, which no longer exists — so after upgrading, the
+right-click action fails until you replace it:
+
+1. Add the new Quick Action using the steps above.
+2. Delete the old **→ aiff** shortcut in Shortcuts.app.
+
+Two other things moved: every `TOAIFF_*` environment variable is now `DECANT_*`,
+and the log lives at `~/Library/Logs/decant.log` instead of `toaiff.log`.
+
 ## Use from the terminal
 
 ```sh
-toaiff ~/Music/Album            # recurse a folder
-toaiff track.flac other.wav     # one or more files
-toaiff --dry-run ~/Music/Album  # preview tags/conversions, write nothing
-toaiff --no-enrich ~/Music/Album  # pure transcode, skip all tag enrichment
-toaiff --version
+decant ~/Music/Album            # recurse a folder
+decant track.flac other.wav     # one or more files
+decant --dry-run ~/Music/Album  # preview tags/conversions, write nothing
+decant --no-enrich ~/Music/Album  # pure transcode, skip all tag enrichment
+decant --version
 ```
 
 ## What gets converted
@@ -97,7 +112,7 @@ holding AAC takes the MP3 path.
 ## How quality is preserved
 
 ffmpeg's AIFF encoder defaults to 16-bit, which would silently downsample
-24-bit masters. `toaiff` reads each source's true bit depth and selects a PCM
+24-bit masters. `decant` reads each source's true bit depth and selects a PCM
 target that is always **≥** the source depth:
 
 | Source | AIFF target |
@@ -116,7 +131,7 @@ artwork is dropped with a logged note.
 ### Lossy `.m4a` / `.opus` → MP3
 
 A lossy source can't become lossless again, so re-encoding it at a *higher*
-bitrate would only waste space. `toaiff` reads the source's real bitrate and
+bitrate would only waste space. `decant` reads the source's real bitrate and
 picks the **highest standard MP3 CBR rate that doesn't exceed it** (320 kbps
 max, LAME's best-quality algorithm): a 256 kbps AAC becomes a 256 kbps MP3, a
 96 kbps Opus never becomes a 320 kbps MP3. If the source bitrate is unknown,
@@ -137,10 +152,10 @@ The output is deliberately the most **CDJ/rekordbox-compatible** MP3 possible:
 
 ## Metadata enrichment
 
-During conversion, `toaiff` derives tags that live in the file/folder names but
+During conversion, `decant` derives tags that live in the file/folder names but
 are missing from the audio tags, and applies one normalization. Everything is
 **fill-gaps-only** — an existing tag is never overwritten — and enrichment is
-**on by default**. Turn it off with `--no-enrich` (or `TOAIFF_NO_ENRICH=1`) for
+**on by default**. Turn it off with `--no-enrich` (or `DECANT_NO_ENRICH=1`) for
 a pure transcode.
 
 | Enrichment | Source | Written to | Rule |
@@ -160,14 +175,14 @@ the guesswork, run with `--no-enrich`.
 Preview exactly what each file would get, without writing anything:
 
 ```sh
-toaiff --dry-run ~/Music/Album
-# toaiff: would convert 02 - Lion Soul (feat. X).flac (pcm_s24be) [grouping=ARTKL081 track=2 title=Lion Soul (ft. X) art=cover.png]
+decant --dry-run ~/Music/Album
+# decant: would convert 02 - Lion Soul (feat. X).flac (pcm_s24be) [grouping=ARTKL081 track=2 title=Lion Soul (ft. X) art=cover.png]
 ```
 
 ## How it works
 
-ffmpeg writes the `.aiff` directly to its final path, and the original is
-trashed only after the output is verified to be a readable AIFF. On any failure
+ffmpeg writes the `.aiff`/`.mp3` directly to its final path, and the original is
+trashed only after the output is verified to be readable audio. On any failure
 the original is left exactly as it was.
 
 <details>
@@ -176,7 +191,7 @@ the original is left exactly as it was.
 A Finder Quick Action runs the script sandboxed under `ShortcutsMacHelper`. In
 TCC-protected folders (Desktop / Documents / Downloads) that sandbox lets a
 *child* process (ffmpeg) **create** files but won't let the shell **rename or
-delete a file ffmpeg made**. So `toaiff` has ffmpeg write the `.aiff` **directly
+delete a file ffmpeg made**. So `decant` has ffmpeg write the output **directly
 to its final name** (no temp + rename) and trashes the original via
 `NSFileManager`, which the Quick Action's scoped access to the selected file
 permits. That's also why a true Quick Action here must be a Shortcut: a
@@ -186,29 +201,29 @@ macOS.
 
 ## Logging
 
-One central log at **`~/Library/Logs/toaiff.log`**, appended to no matter where
+One central log at **`~/Library/Logs/decant.log`**, appended to no matter where
 the action runs. **By default only errors are logged**, so a clean run writes
 nothing. For a full trace of every run / conversion / skip:
 
 ```sh
-toaiff --debug ~/Music/Album        # or set TOAIFF_DEBUG=1
-tail -f ~/Library/Logs/toaiff.log
+decant --debug ~/Music/Album        # or set DECANT_DEBUG=1
+tail -f ~/Library/Logs/decant.log
 ```
 
 To debug the Finder Quick Action, add `--debug` to its Run Shell Script line
-temporarily — change `exec toaiff --notify "$@"` to
-`exec toaiff --notify --debug "$@"`.
+temporarily — change `exec decant --notify "$@"` to
+`exec decant --notify --debug "$@"`.
 
 ## Configuration
 
 | Flag | Env | Effect |
 |------|-----|--------|
-| `--no-enrich` | `TOAIFF_NO_ENRICH` | Pure transcode; skip all tag enrichment. |
+| `--no-enrich` | `DECANT_NO_ENRICH` | Pure transcode; skip all tag enrichment. |
 | `--dry-run` | — | Preview the tag/conversion plan; write and trash nothing. |
-| `--debug` | `TOAIFF_DEBUG` | Log every run/conversion/skip, not just errors. |
-| — | `TOAIFF_KEEP_ORIGINALS` | Convert without trashing originals (cautious first pass). |
-| — | `TOAIFF_NO_NOTIFY` | Suppress the completion notification even with `--notify`. |
-| — | `TOAIFF_LOG` | Override the log file path (used by the test suite). |
+| `--debug` | `DECANT_DEBUG` | Log every run/conversion/skip, not just errors. |
+| — | `DECANT_KEEP_ORIGINALS` | Convert without trashing originals (cautious first pass). |
+| — | `DECANT_NO_NOTIFY` | Suppress the completion notification even with `--notify`. |
+| — | `DECANT_LOG` | Override the log file path (used by the test suite). |
 
 > **No stray output files:** as a Finder Quick Action the script runs with
 > `--notify` and no terminal, so it writes nothing to stdout/stderr — which the
@@ -218,11 +233,11 @@ temporarily — change `exec toaiff --notify "$@"` to
 ## Uninstall
 
 ```sh
-brew uninstall toaiff                 # or: rm ~/.local/bin/toaiff
-rm -f ~/Library/Logs/toaiff.log
+brew uninstall decant                 # or: rm ~/.local/bin/decant
+rm -f ~/Library/Logs/decant.log
 ```
 
-Then delete the **→ aiff** shortcut in Shortcuts.app and toggle it off in
+Then delete the **Decant** shortcut in Shortcuts.app and toggle it off in
 System Settings ▸ Login Items & Extensions ▸ Finder.
 
 ## Contributing
@@ -233,10 +248,19 @@ Issues and PRs welcome. Run the test suite before submitting:
 ./tests/run.sh
 ```
 
-It generates fixtures with ffmpeg and exercises depth preservation, metadata and
-artwork retention, enrichment + decoy rejection, recursion, skipping, and
-logging — all non-destructively (no files are trashed). CI runs the same suite
-on every PR.
+It generates fixtures with ffmpeg and exercises depth preservation, bitrate
+capping, metadata and artwork retention, enrichment + decoy rejection,
+recursion, skipping, and logging — all non-destructively (no files are
+trashed). CI runs the same suite on every PR.
+
+The Quick Action is built from [`shortcut/decant.shortcut.plist`](shortcut/).
+After editing it, re-sign the distributable copy — note the input **must** end
+in `.shortcut` or the signer rejects it:
+
+```sh
+cp shortcut/decant.shortcut.plist /tmp/Decant.shortcut
+shortcuts sign --mode anyone --input /tmp/Decant.shortcut --output shortcut/Decant.shortcut
+```
 
 ## License
 
