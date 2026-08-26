@@ -57,7 +57,7 @@
 				</dict>
 				<key>Script</key>
 				<string>export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-exec toaiff --notify "$@"</string>
+exec decant --notify "$@"</string>
 			</dict>
 		</dict>
 	</array>

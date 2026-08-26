@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 #
-# toaiff — convert lossless audio to AIFF without quality reduction, and
+# decant — convert lossless audio to AIFF without quality reduction, and
 # lossy .m4a/.opus files to MP3 at the highest bitrate that does not exceed
 # the source's (so a lossy file is never inflated past its real quality).
 #
@@ -9,13 +9,13 @@
 # original is moved to the Trash once its output is written successfully.
 #
 # Usage:
-#   toaiff [--notify] [--debug] [--dry-run] [--no-enrich] PATH [PATH ...]
-#   toaiff --version
+#   decant [--notify] [--debug] [--dry-run] [--no-enrich] PATH [PATH ...]
+#   decant --version
 
 emulate -L zsh
 setopt pipefail extended_glob
 
-TOAIFF_VERSION="0.2.0"
+DECANT_VERSION="0.2.0"
 
 # GUI-launched processes (Finder Quick Action / Automator) inherit a minimal
 # PATH that omits Homebrew, so ffmpeg/ffprobe/brew would be invisible. Make the
@@ -26,34 +26,34 @@ NOTIFY=0
 DEBUG=0
 DRYRUN=0
 ENRICH=1
-[[ -n "${TOAIFF_DEBUG:-}" ]] && DEBUG=1
-[[ -n "${TOAIFF_NO_ENRICH:-}" ]] && ENRICH=0
+[[ -n "${DECANT_DEBUG:-}" ]] && DEBUG=1
+[[ -n "${DECANT_NO_ENRICH:-}" ]] && ENRICH=0
 while true; do
   case "${1:-}" in
     --notify)    NOTIFY=1; shift ;;
     --debug)     DEBUG=1; shift ;;
     --dry-run)   DRYRUN=1; shift ;;
     --no-enrich) ENRICH=0; shift ;;
-    --version)   print -r -- "toaiff $TOAIFF_VERSION"; exit 0 ;;
+    --version)   print -r -- "decant $DECANT_VERSION"; exit 0 ;;
     *) break ;;
   esac
 done
 
 if (( $# == 0 )); then
-  print -u2 "usage: toaiff [--notify] [--debug] [--dry-run] [--no-enrich] PATH [PATH ...]"
-  print -u2 "       toaiff --version"
+  print -u2 "usage: decant [--notify] [--debug] [--dry-run] [--no-enrich] PATH [PATH ...]"
+  print -u2 "       decant --version"
   exit 64
 fi
 
 typeset -i converted=0 skipped=0 failed=0 previewed=0
 
 # One central, always-appended log regardless of where the action is run from.
-# (TOAIFF_LOG only overrides the path for the test suite.)
-LOG_FILE="${TOAIFF_LOG:-$HOME/Library/Logs/toaiff.log}"
+# (DECANT_LOG only overrides the path for the test suite.)
+LOG_FILE="${DECANT_LOG:-$HOME/Library/Logs/decant.log}"
 mkdir -p "${LOG_FILE:h}" 2>/dev/null
 
 # Errors (FAILED / REFUSED) are logged always. Everything else (per-file
-# conversions, skips, run markers) is logged only with --debug / TOAIFF_DEBUG.
+# conversions, skips, run markers) is logged only with --debug / DECANT_DEBUG.
 log_line() {
   print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE" 2>/dev/null
 }
@@ -76,13 +76,13 @@ ensure_tools() {
     return 0
   fi
   if (( ! $+commands[brew] )); then
-    print -u2 "toaiff: ffmpeg/ffprobe not found and Homebrew is unavailable to install them."
+    print -u2 "decant: ffmpeg/ffprobe not found and Homebrew is unavailable to install them."
     print -u2 "        Install Homebrew (https://brew.sh) or ffmpeg, then retry."
     exit 69
   fi
-  print -u2 "toaiff: installing ffmpeg via Homebrew…"
+  print -u2 "decant: installing ffmpeg via Homebrew…"
   if ! brew install ffmpeg; then
-    print -u2 "toaiff: 'brew install ffmpeg' failed."
+    print -u2 "decant: 'brew install ffmpeg' failed."
     exit 69
   fi
 }
@@ -277,7 +277,7 @@ build_meta_args() {
 }
 
 trash_original() {
-  [[ -n "${TOAIFF_KEEP_ORIGINALS:-}" ]] && return 0
+  [[ -n "${DECANT_KEEP_ORIGINALS:-}" ]] && return 0
   local abs="${1:A}"
   # Use NSFileManager (not Apple Events to Finder): moves to Trash with Put Back
   # support and, crucially, never triggers the "control Finder" automation prompt
@@ -419,7 +419,7 @@ process_file() {
 
   local dest="${src:r}.$out_fmt"
   if [[ -e "$dest" && "${dest:A}" != "${src:A}" ]]; then
-    print -u2 "toaiff: skip ${src:t} — ${dest:t} already exists"
+    print -u2 "decant: skip ${src:t} — ${dest:t} already exists"
     log_debug "SKIP (target exists) $src"
     (( skipped++ )); return
   fi
@@ -451,7 +451,7 @@ process_file() {
 
   # Read existing tags + art presence, then compute the fill-gaps-only
   # enrichment plan (catalog→grouping, track/disc, feat→ft, folder art).
-  # Skipped entirely under --no-enrich / TOAIFF_NO_ENRICH (pure transcode).
+  # Skipped entirely under --no-enrich / DECANT_NO_ENRICH (pure transcode).
   META_ARGS=(); META_PLAN=(); ART_INPUT=""
   if (( ENRICH )); then
     # ffprobe prefixes tag keys with "TAG:" and a value can itself contain
@@ -474,9 +474,9 @@ process_file() {
 
   if (( DRYRUN )); then
     if (( ${#META_PLAN} )); then
-      print -u2 -- "toaiff: would convert ${src:t} ($label) [${(j: :)META_PLAN}]"
+      print -u2 -- "decant: would convert ${src:t} ($label) [${(j: :)META_PLAN}]"
     else
-      print -u2 -- "toaiff: would convert ${src:t} ($label)"
+      print -u2 -- "decant: would convert ${src:t} ($label)"
     fi
     (( previewed++ )); return
   fi
@@ -489,9 +489,9 @@ process_file() {
   # Documents. The original is trashed only after the output is verified valid.
   if convert_file "$src" "$tgt" "$dest" "$out_fmt" && [[ -s "$dest" ]] && valid_audio "$dest"; then
     trash_original "$src"
-    print -u2 -- "toaiff: converted ${src:t} → ${dest:t} ($label)"
+    print -u2 -- "decant: converted ${src:t} → ${dest:t} ($label)"
     if (( ART_DROPPED )); then
-      print -u2 "toaiff: note: dropped unembeddable artwork for ${src:t}"
+      print -u2 "decant: note: dropped unembeddable artwork for ${src:t}"
       log_debug "CONVERTED (artwork dropped) $src -> $dest [$label]"
     else
       log_debug "CONVERTED $src -> $dest [$label]"
@@ -499,7 +499,7 @@ process_file() {
     (( converted++ ))
   else
     discard_output "$dest"
-    print -u2 "toaiff: FAILED ${src:t}"
+    print -u2 "decant: FAILED ${src:t}"
     log_line "FAILED $src [$tgt] :: ${CONVERT_ERR:-unknown error}"
     (( failed++ ))
   fi
@@ -521,7 +521,7 @@ is_forbidden_root() {
 process_path() {
   local p="$1"
   if is_forbidden_root "$p"; then
-    print -u2 "toaiff: refusing to recurse '$p' (too broad — point me at a file or an album folder)"
+    print -u2 "decant: refusing to recurse '$p' (too broad — point me at a file or an album folder)"
     log_line "REFUSED (forbidden root) $p"
     return
   fi
@@ -533,11 +533,11 @@ process_path() {
   elif [[ -f "$p" ]]; then
     process_file "$p"
   else
-    print -u2 "toaiff: not found: $p"
+    print -u2 "decant: not found: $p"
   fi
 }
 
-# Non-destructive diagnostic: `toaiff --check-root PATH` exits 0 if PATH is a
+# Non-destructive diagnostic: `decant --check-root PATH` exits 0 if PATH is a
 # forbidden (too-broad) root, 2 if it would be processed. Used by the tests to
 # verify the guard without ever scanning a real root.
 if [[ "${1:-}" == "--check-root" ]]; then
@@ -572,20 +572,20 @@ for arg in "$@"; do
 done
 
 if (( DRYRUN )); then
-  print -u2 -- "toaiff: dry run — ${previewed} file(s) would convert, nothing changed"
+  print -u2 -- "decant: dry run — ${previewed} file(s) would convert, nothing changed"
   exit 0
 fi
 
 # Human-readable summary goes to stderr (discarded entirely in the Quick Action
 # context above, where it would otherwise be captured to a stray file). The log
 # keeps the full triple for debugging; the notification stays concise.
-print -u2 -- "toaiff: $(summary_line)"
+print -u2 -- "decant: $(summary_line)"
 log_debug "RUN done: ${converted} converted, ${skipped} skipped, ${failed} failed"
 
-if (( NOTIFY )) && [[ -z "${TOAIFF_NO_NOTIFY:-}" ]]; then
+if (( NOTIFY )) && [[ -z "${DECANT_NO_NOTIFY:-}" ]]; then
   /usr/bin/osascript \
     -e 'on run argv' \
-    -e 'display notification (item 1 of argv) with title "Convert to AIFF"' \
+    -e 'display notification (item 1 of argv) with title "Decant"' \
     -e 'end run' \
     "$(summary_line)" >/dev/null 2>&1
 fi
