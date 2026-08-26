@@ -1,9 +1,11 @@
 #!/usr/bin/env zsh
 #
-# Behavioural tests for decant. Non-destructive: DECANT_KEEP_ORIGINALS keeps
-# source files in place and DECANT_LOG redirects the log away from
-# ~/Library/Logs. The trash-fallback tests do move fixtures, but
-# DECANT_TRASH_DIR points them at a throwaway folder inside $WORK, never the
+# Behavioural tests for decant. Nothing outside the /tmp sandbox is touched:
+# DECANT_KEEP_ORIGINALS keeps source files in place and DECANT_LOG redirects the
+# log away from ~/Library/Logs. The trash-fallback tests do move fixtures, but
+# DECANT_TRASH_DIR points them at a throwaway folder inside $WORK; the tests of
+# the primary NSFileManager path, which no environment variable can redirect,
+# run on a temporary disk image whose Trash is its own. Neither ever reaches the
 # real ~/.Trash. Requires ffmpeg/ffprobe.
 
 emulate -L zsh
@@ -61,10 +63,62 @@ assert_true() {
   fi
 }
 
-# #given a sandbox with one representative file per scenario
-WORK=$(mktemp -d /tmp/decant-tests.XXXXXX)
+# #given a sandbox with one representative file per scenario. :A resolves /tmp's
+# symlink so the sandbox path is the canonical one hdiutil and mount(8) report,
+# rather than two spellings of the same directory.
+WORK=$(mktemp -d /tmp/decant-tests.XXXXXX) || {
+  print -u2 -- "tests: could not create a work directory under /tmp"
+  exit 1
+}
+WORK="${WORK:A}"
 LOG="$WORK/decant.log"
 mkdir -p "$WORK/sub"
+
+# True when PATH sits on a different filesystem from the sandbox — which is the
+# question that actually matters, both for "did the disk image really mount
+# here" and for "is it still mounted". Comparing devices beats matching mount(8)
+# output: no path spelling to get wrong, and a wrong answer either strands a
+# mounted volume or sends a trash test at the operator's real Trash.
+own_volume() {
+  local here there
+  here="$(df -Pk "$1" 2>/dev/null | awk 'NR==2{print $1}')"
+  there="$(df -Pk "$WORK" 2>/dev/null | awk 'NR==2{print $1}')"
+  [[ -n "$here" && "$here" != "$there" ]]
+}
+
+# Teardown runs on every way out, not just the happy one: an aborted run used to
+# leave its /tmp sandbox behind, and once a disk image is involved a leak is a
+# volume that stays mounted after the shell is gone. zsh does not run an EXIT
+# trap for an untrapped signal, so the signals are wired up explicitly.
+typeset -g TRASH_VOL=""
+typeset -i CLEANED=0
+cleanup() {
+  (( CLEANED )) && return 0
+  CLEANED=1
+  # Detached unconditionally rather than only when it looks mounted: a leaked
+  # volume outlives the shell, so a pointless detach is the cheaper mistake.
+  if [[ -n "$TRASH_VOL" ]]; then
+    hdiutil detach "$TRASH_VOL" -quiet 2>/dev/null ||
+      hdiutil detach "$TRASH_VOL" -force -quiet 2>/dev/null
+    # Deleting the sandbox around a volume that is still mounted would delete
+    # through the mount point, so say what was left behind instead.
+    if own_volume "$TRASH_VOL"; then
+      print -u2 -- "tests: WARNING could not detach $TRASH_VOL — leaving $WORK for you to clean up"
+      return 0
+    fi
+  fi
+  # Several sections chmod a directory read-only and restore it afterwards; an
+  # interrupt in between would leave rm(1) unable to unlink what is inside it.
+  if [[ -n "$WORK" && -d "$WORK" ]]; then
+    chmod -R u+w "$WORK" 2>/dev/null
+    rm -rf "$WORK"
+  fi
+  return 0
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
 
 gen_flac24_with_art() {
   ffmpeg -nostdin -hide_banner -loglevel error \
@@ -963,19 +1017,9 @@ assert_true "--keep works after the path, like every other flag" \
             test -f "$KP/order.flac"
 DECANT_LOG="$LOG" "$DECANT" --keep --dry-run "$KP/dry.flac" >/dev/null 2>&1
 assert_eq   "--keep combined with --dry-run exits 0" "0" "$?"
-# The one place the suite lets decant really trash something: proving --keep
-# changes the outcome needs a run without it. HOME points at a scratch directory
-# so the ~/.Trash fallback stays inside the sandbox; when the NSFileManager path
-# wins instead the fixture lands in the real Trash — recoverable, and named to
-# be recognisable as test debris.
-TH="$WORK/trashhome"; mkdir -p "$TH/.Trash"
-mkflac "$KP/decant-selftest-trashme.flac" 491
-HOME="$TH" DECANT_LOG="$LOG" "$DECANT" "$KP/decant-selftest-trashme.flac" >/dev/null 2>&1
-assert_eq   "a run with neither --keep nor the env var exits 0" "0" "$?"
-assert_true "...and really does trash the original, so --keep is what preserves it" \
-            test ! -f "$KP/decant-selftest-trashme.flac"
-assert_true "...leaving its conversion behind" \
-            test -f "$KP/decant-selftest-trashme.aiff"
+# Proving --keep is what preserves an original needs a run WITHOUT it, which is
+# the one thing this sandbox cannot contain — see "trashing" near the foot of
+# this file, which does it on a disk image of its own.
 
 print -r -- "log rotation: the log cannot grow forever"
 RL="$WORK/rotate"; mkdir -p "$RL"
@@ -1301,7 +1345,205 @@ assert_eq   "the run still exits 0 — the conversion succeeded" "0" "$FRC"
 assert_eq   "…and the summary still counts it as converted" "decant: 1 converted" \
             "$(tail -1 <<< "$FOUT")"
 
-rm -rf "$WORK"
+# #given one source and one valid destination, alone. "recovery" above proves
+# the existing file survives byte-for-byte and that the skip is announced; what
+# a run over a folder of mixed outcomes cannot show is the reason reaching the
+# log, or the skip landing in the summary as a skip rather than a failure.
+print -r -- "destination already exists: logged under its own reason, counted as a skip"
+DE="$WORK/destexists"; mkdir -p "$DE"
+mkflac "$DE/t.flac" 540
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=541:duration=1" \
+  -c:a pcm_s16be "$DE/t.aiff"
+DELOG="$WORK/destexists.log"; : > "$DELOG"
+DEOUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$DELOG" "$DECANT" "$DE/t.flac" 2>&1 >/dev/null)"
+assert_eq   "a source whose target already exists exits 0" "0" "$?"
+assert_eq   "...and counts as a skip, not a conversion or a failure" "decant: 1 skipped" \
+            "$(tail -1 <<< "$DEOUT")"
+assert_true "the log gives 'target exists' as the reason" \
+            grep -q "SKIP (target exists)" "$DELOG"
+
+# #given artwork the target muxer refuses outright: a PPM wearing a .png name,
+# which find_folder_art picks up (it matches on the name) and ffmpeg reads
+# happily, but for which the ID3v2 APIC writer knows no MIME type. The audio has
+# to survive the rejection, and the caller has to be told what was lost.
+print -r -- "art the muxer rejects: the audio still converts, minus the art"
+AD="$WORK/artdrop"; mkdir -p "$AD"
+ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "color=c=red:s=32x32:d=1" \
+  -frames:v 1 -c:v ppm -f image2 "$AD/cover.png"
+mkflac "$AD/01 - Track.flac" 545
+assert_eq   "the fixture really is art the AIFF muxer cannot embed" "ppm" \
+            "$(probe -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$AD/cover.png")"
+ADLOG="$WORK/artdrop.log"; : > "$ADLOG"
+ADOUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$ADLOG" "$DECANT" "$AD" 2>&1 >/dev/null)"
+assert_eq   "dropping unembeddable art is not a failure" "0" "$?"
+assert_true "the conversion happens anyway" \
+            test -f "$AD/01 - Track.aiff"
+assert_true "the note says which file lost its artwork" \
+            grep -qF -- "note: dropped unembeddable artwork for 01 - Track.flac" <<< "$ADOUT"
+assert_eq   "...and the run still reports a conversion" "decant: 1 converted" \
+            "$(tail -1 <<< "$ADOUT")"
+assert_true "the log records the fallback, not a plain conversion" \
+            grep -q "CONVERTED (artwork dropped)" "$ADLOG"
+assert_eq   "no art stream is left on the output" "" \
+            "$(probe -select_streams v -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$AD/01 - Track.aiff")"
+assert_eq   "the audio is still bit-exact after the second pass" \
+            "$(pcm_md5 "$AD/01 - Track.flac")" "$(pcm_md5 "$AD/01 - Track.aiff")"
+
+print -r -- "a failed conversion: output discarded, failure logged, nothing lost"
+FL="$WORK/failpath"; mkdir -p "$FL"
+mkflac "$FL/t.flac" 550
+# An unwritable folder is the cheapest genuine ffmpeg failure: both the
+# art-preserving pass and the audio-only fallback fail to create the output.
+chmod a-w "$FL"
+FLLOG="$WORK/failpath.log"; : > "$FLLOG"
+FLOUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$FLLOG" "$DECANT" "$FL/t.flac" 2>&1 >/dev/null)"
+assert_eq   "a conversion failure exits 1" "1" "$?"
+assert_true "the failure is named on stderr" \
+            grep -qF -- "decant: FAILED t.flac" <<< "$FLOUT"
+assert_eq   "...and counted in the summary" "decant: 1 failed" \
+            "$(tail -1 <<< "$FLOUT")"
+assert_true "FAILED is logged without --debug, like every other error" \
+            grep -q "FAILED .*t\.flac" "$FLLOG"
+assert_true "...carrying ffmpeg's own reason, not just 'unknown error'" \
+            grep -qE "FAILED .*t\.flac \[pcm_s16be\] :: .+" "$FLLOG"
+assert_eq   "a failed run logs no CONVERTED line" "0" \
+            "$(grep -c 'CONVERTED' "$FLLOG")"
+assert_true "no half-written output is left behind" \
+            test ! -e "$FL/t.aiff"
+chmod u+w "$FL"
+
+# #given a scratch volume of the suite's own. macOS trashes a file from a
+# non-boot volume into that volume's own .Trashes/<uid>, so a disk image is the
+# only way to exercise the real NSFileManager path with the side effect
+# contained — a temporary $HOME cannot do it, because trashItemAtURL resolves
+# the Trash from the process owner and ignores the environment.
+mount_trash_volume() {
+  local img="$WORK/trashvol.sparseimage" mnt="$WORK/trashvol"
+  mkdir -p "$mnt" || return 1
+  hdiutil create -size 24m -fs HFS+ -volname decant-tests -type SPARSE -quiet "$img" 2>/dev/null || return 1
+  hdiutil attach "$img" -nobrowse -noverify -mountpoint "$mnt" -quiet 2>/dev/null || return 1
+  # Recorded before the check below: anything attached has to reach the teardown,
+  # even an attach that landed somewhere this run then declines to use.
+  TRASH_VOL="$mnt"
+  # An attach that reported success but did not put a filesystem here would
+  # leave the tests writing to the boot volume — and trashing into the real
+  # Trash, the exact thing this whole apparatus exists to avoid.
+  own_volume "$mnt" || return 1
+  return 0
+}
+
+print -r -- "trashing: the original is really moved to the Trash, and only on success"
+if mount_trash_volume; then
+  VT="$TRASH_VOL/album"; mkdir -p "$VT"
+  VTRASH="$TRASH_VOL/.Trashes/$(id -u)"
+  mkflac "$VT/keepme.flac" 560
+  mkflac "$VT/trashme.flac" 561
+  DECANT_LOG="$LOG" "$DECANT" --keep "$VT/keepme.flac" >/dev/null 2>&1
+  assert_true "--keep leaves the original at its path" \
+              test -f "$VT/keepme.flac"
+  assert_true "...and puts nothing in the Trash" \
+              test ! -e "$VTRASH/keepme.flac"
+  DECANT_LOG="$LOG" "$DECANT" "$VT/trashme.flac" >/dev/null 2>&1
+  assert_eq   "a run with neither --keep nor the env var exits 0" "0" "$?"
+  assert_true "...writes the conversion" \
+              test -f "$VT/trashme.aiff"
+  assert_true "...and really does move the original out of its folder" \
+              test ! -e "$VT/trashme.flac"
+  assert_true "...into the Trash, recoverable, never deleted" \
+              test -f "$VTRASH/trashme.flac"
+  assert_eq   "...intact, byte for byte" "$(pcm_md5 "$VT/trashme.aiff")" \
+              "$(pcm_md5 "$VTRASH/trashme.flac")"
+
+  # #when the volume fills up mid-write, ffmpeg fails on a file decant would
+  # otherwise have trashed — the assertion that matters is on a volume where
+  # trashing demonstrably works, two assertions above.
+  FV="$TRASH_VOL/full"; mkdir -p "$FV"
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=562:duration=20" \
+    -sample_fmt s32 -bits_per_raw_sample 24 -c:a flac "$FV/big.flac"
+  FREE_K="$(df -Pk "$TRASH_VOL" | awk 'NR==2{print $4}')"
+  dd if=/dev/zero of="$TRASH_VOL/filler" bs=1024 count=$(( FREE_K - 256 )) 2>/dev/null
+  FVLOG="$WORK/diskfull.log"; : > "$FVLOG"
+  DECANT_LOG="$FVLOG" "$DECANT" "$FV/big.flac" >/dev/null 2>&1
+  assert_eq   "a conversion that runs out of room exits 1" "1" "$?"
+  assert_true "...logs the failure with ffmpeg's reason" \
+              grep -q "FAILED .*big\.flac" "$FVLOG"
+  assert_true "...discards the partial output" \
+              test ! -e "$FV/big.aiff"
+  assert_true "...leaves the original exactly where it was" \
+              test -f "$FV/big.flac"
+  assert_true "...and does NOT trash it" \
+              test ! -e "$VTRASH/big.flac"
+  rm -f "$TRASH_VOL/filler"
+else
+  print -r -- "  – skipped trashing tests: could not create and attach a scratch disk image here"
+  print -r -- "    (hdiutil is unavailable or not permitted; the real Trash is never used instead)"
+fi
+
+# #given three sources of one version number. The Homebrew tap holds a fourth
+# and lives in another repository, so it can only be checked at release time.
+print -r -- "version: the script, its --version output, and the README agree"
+README="${0:A:h}/../README.md"
+SCRIPT_VERSION="$(sed -n 's/^DECANT_VERSION="\(.*\)"$/\1/p' "$DECANT")"
+README_VERSION="$(sed -n 's|.*img\.shields\.io/badge/version-\([0-9][0-9.]*\)-.*|\1|p' "$README" | head -1)"
+assert_true "the script defines a version" \
+            test -n "$SCRIPT_VERSION"
+assert_true "the README documents one" \
+            test -n "$README_VERSION"
+assert_eq   "the README's version is the script's" "$SCRIPT_VERSION" "$README_VERSION"
+assert_eq   "--version prints exactly that" "decant $SCRIPT_VERSION" \
+            "$("$DECANT" --version)"
+
+# #given a throwaway HOME. install.sh writes only under $HOME, so pointing it at
+# a scratch directory exercises the whole installer without going near the
+# operator's own ~/.local/bin.
+print -r -- "install.sh: installs under HOME, and nowhere else"
+INSTALLER="${0:A:h}/../install.sh"
+IH="$WORK/installhome"; mkdir -p "$IH"
+IBIN="$IH/.local/bin/decant"
+IOUT="$(HOME="$IH" zsh "$INSTALLER" 2>&1)"
+assert_eq   "a fresh install exits 0" "0" "$?"
+assert_true "the CLI lands in ~/.local/bin" \
+            test -f "$IBIN"
+assert_true "...executable" \
+            test -x "$IBIN"
+assert_eq   "...mode 0755, not whatever the source happened to be" "755" \
+            "$(stat -f '%Lp' "$IBIN")"
+assert_true "...byte-identical to the repo's copy" \
+            cmp -s "$DECANT" "$IBIN"
+assert_eq   "...and the installed copy runs" "$("$DECANT" --version)" \
+            "$("$IBIN" --version)"
+assert_true "the installer says where it put it" \
+            grep -qF -- "installed: $IBIN" <<< "$IOUT"
+assert_true "...and points at the Quick Action recipe it cannot install for you" \
+            grep -qF -- "Finder Quick Action" <<< "$IOUT"
+assert_true "a bin dir that is not on PATH gets the PATH tip" \
+            grep -qF -- "add $IH/.local/bin to your PATH" <<< "$IOUT"
+IOUT_PATH="$(HOME="$IH" PATH="$IH/.local/bin:$PATH" zsh "$INSTALLER" 2>&1)"
+assert_eq   "...and no tip once it is on PATH" "0" \
+            "$(grep -c 'to your PATH' <<< "$IOUT_PATH")"
+HOME="$IH" zsh "$INSTALLER" >/dev/null 2>&1
+assert_eq   "re-running the installer is harmless" "0" "$?"
+assert_true "...and leaves the same binary in place" \
+            cmp -s "$DECANT" "$IBIN"
+# #then the two leftovers from the toaiff era must be cleaned up, loudly enough
+# that nobody is left with a Quick Action that silently no longer works.
+LEGACY_SVC="$IH/Library/Services/→ aiff.workflow"
+mkdir -p "$LEGACY_SVC"
+print -r -- "old binary" > "$IH/.local/bin/toaiff"
+IOUT_LEGACY="$(HOME="$IH" zsh "$INSTALLER" 2>&1)"
+assert_eq   "an upgrade over a toaiff install exits 0" "0" "$?"
+assert_true "the obsolete Service bundle is removed" \
+            test ! -e "$LEGACY_SVC"
+assert_true "...and said so" \
+            grep -qF -- "removed obsolete Service" <<< "$IOUT_LEGACY"
+assert_true "the retired toaiff binary is removed" \
+            test ! -e "$IH/.local/bin/toaiff"
+assert_true "...and the broken Quick Action is called out, not left to fail silently" \
+            grep -qF -- "ACTION NEEDED" <<< "$IOUT_LEGACY"
+assert_true "...naming the shortcut to re-import" \
+            grep -qF -- "Decant.shortcut" <<< "$IOUT_LEGACY"
+assert_true "a fresh install says nothing about a toaiff that was never there" \
+            test -z "$(grep 'ACTION NEEDED' <<< "$IOUT")"
 
 print -r -- ""
 print -r -- "Results: ${pass} passed, ${fail} failed"

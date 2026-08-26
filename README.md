@@ -1,6 +1,7 @@
 # decant
 
 [![tests](https://github.com/jzstern/decant/actions/workflows/tests.yml/badge.svg)](https://github.com/jzstern/decant/actions/workflows/tests.yml)
+[![version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://github.com/jzstern/decant/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
@@ -371,18 +372,25 @@ Issues and PRs welcome. Run the test suite before submitting:
 ```
 
 It generates fixtures with ffmpeg and exercises depth preservation, bitrate
-capping, metadata and artwork retention, codec classification, stream mapping,
-`ffmpeg` resolution and its bootstrap, enrichment + decoy rejection, recursion,
-skipping, logging and its rotation, the CLI contract (exit codes, flag
-parsing), interrupt cleanup, recovery from a stranded destination, and Trash
-uniquification. CI runs the same suite on every PR.
+capping, metadata and artwork retention (including the fallback that drops art
+the muxer refuses), codec classification, stream mapping, `ffmpeg` resolution
+and its bootstrap, enrichment + decoy rejection, recursion, skipping, trashing,
+failure handling, logging and its rotation, `install.sh`, the CLI contract (exit
+codes, flag parsing), interrupt cleanup, recovery from a stranded destination,
+and Trash uniquification. CI syntax-checks every script and runs the same suite
+on every PR.
 
-Almost every assertion runs with `DECANT_KEEP_ORIGINALS` set, so nothing of
-yours is touched; the trash-fallback tests do move fixtures, but
-`DECANT_TRASH_DIR` sends them to a throwaway folder rather than your real
-`~/.Trash`. The exception is the one test that proves `--keep` is what
-preserves an original: it lets decant trash a fixture for real, which leaves a
-single recoverable `decant-selftest-trashme.flac` in your Trash.
+**Nothing of yours is touched.** Fixtures live in a `/tmp` sandbox that is torn
+down even if the run is interrupted, `DECANT_LOG` keeps the log out of
+`~/Library/Logs`, and almost every assertion runs with `DECANT_KEEP_ORIGINALS`
+set. The trash-fallback tests do move fixtures, but `DECANT_TRASH_DIR` sends
+them to a throwaway folder rather than your real `~/.Trash`. The tests that must
+exercise the *primary* `NSFileManager` path — which resolves the Trash from the
+process owner and so ignores any override — mount a small temporary disk image
+and run there: macOS trashes files from a non-boot volume into that volume's own
+`.Trashes`, so your Trash never sees them, and the image is detached and deleted
+afterwards. Where a disk image can't be created, those tests print that they
+were skipped rather than falling back to your Trash.
 
 The Quick Action is built from [`shortcut/decant.shortcut.plist`](shortcut/).
 After editing it, re-sign the distributable copy — note the input **must** end

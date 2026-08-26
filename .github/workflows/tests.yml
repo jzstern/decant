@@ -11,6 +11,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Before the ffmpeg install, so a typo fails in seconds rather than after
+      # a Homebrew download. `zsh -n a b c` only parses the first argument and
+      # treats the rest as positional parameters, so each file needs its own run.
+      - name: Syntax check
+        run: |
+          for f in bin/decant tests/run.sh install.sh; do
+            zsh -n "$f"
+            echo "ok: $f"
+          done
+
       - name: Install ffmpeg
         run: |
           if ! command -v ffmpeg >/dev/null 2>&1; then
