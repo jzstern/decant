@@ -1,10 +1,12 @@
 #!/usr/bin/env zsh
 #
-# toaiff — convert lossless audio to AIFF without quality reduction.
+# toaiff — convert lossless audio to AIFF without quality reduction, and
+# lossy .m4a/.opus files to MP3 at the highest bitrate that does not exceed
+# the source's (so a lossy file is never inflated past its real quality).
 #
 # Works on a single file or a folder (recursing into all subfolders).
-# Lossy and non-audio files are left untouched. Each converted original
-# is moved to the Trash once its .aiff is written successfully.
+# Other lossy and non-audio files are left untouched. Each converted
+# original is moved to the Trash once its output is written successfully.
 #
 # Usage:
 #   toaiff [--notify] [--debug] [--dry-run] [--no-enrich] PATH [PATH ...]
@@ -130,6 +132,35 @@ target_codec() {
   fi
 }
 
+# Echo the source audio bitrate in bps — the stream's own value when ffprobe
+# knows it, else the container average (Opus files usually only report the
+# latter) — or nothing when neither is available.
+source_bitrate() {
+  local br
+  br=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate \
+         -of default=nw=1:nk=1 -- "$1" 2>/dev/null)
+  if [[ -z "$br" || "$br" == "N/A" ]]; then
+    br=$(ffprobe -v error -show_entries format=bit_rate \
+           -of default=nw=1:nk=1 -- "$1" 2>/dev/null)
+  fi
+  [[ "$br" == <-> ]] && print -r -- "$br"
+}
+
+# Highest standard MP3 CBR bitrate (kbps) that does not exceed the source
+# bitrate, so a lossy source is never inflated past its real quality. An
+# unknown source bitrate gets the best MP3 can do (320).
+mp3_bitrate_for() {
+  local bps="$1" r
+  if [[ -n "$bps" ]]; then
+    for r in 320 256 224 192 160 128 112 96 80 64 56 48 40 32; do
+      (( bps >= r * 1000 )) && { print -r -- "$r"; return }
+    done
+    print -r -- 32
+  else
+    print -r -- 320
+  fi
+}
+
 # ── Metadata enrichment ─────────────────────────────────────────────────────
 # Derive tags that live in folder/file names but are missing from the audio
 # tags, and normalise feat.→ft. All derivation is fill-gaps-only (set by
@@ -252,10 +283,10 @@ trash_original() {
   mv -f -- "$abs" "$HOME/.Trash/" 2>/dev/null
 }
 
-# A produced file counts as a valid AIFF only if ffprobe can read an audio
-# stream from it — guards against trashing the original when ffmpeg exited 0
-# but wrote something unplayable.
-valid_aiff() {
+# A produced file counts as valid only if ffprobe can read an audio stream
+# from it — guards against trashing the original when ffmpeg exited 0 but
+# wrote something unplayable.
+valid_audio() {
   ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
     -of default=nw=1:nk=1 -- "$1" 2>/dev/null | grep -q .
 }
@@ -274,13 +305,40 @@ discard_output() {
 
 # Sets CONVERT_ERR on total failure and ART_DROPPED when the art-preserving
 # attempt fails but the audio-only fallback succeeds. Writes straight to "$out".
+# ENC_EXTRA carries per-file encoder options (the MP3 bitrate cap); the tag
+# chunk is ID3v2 in both containers — AIFF via its muxer flag, MP3 as v2.3 for
+# widest player compatibility.
 convert_file() {
-  local src="$1" tgt="$2" out="$3"
+  local src="$1" tgt="$2" out="$3" out_fmt="$4"
   CONVERT_ERR=""
   ART_DROPPED=0
-  local -a inputs map
+  local -a inputs map tag_args map_meta
   inputs=(-i "$src")
   map=(-map 0)
+  if [[ "$out_fmt" == mp3 ]]; then
+    tag_args=(-id3v2_version 3)
+  else
+    tag_args=(-write_id3v2 1)
+  fi
+  # Ogg-family containers keep their Vorbis comments on the STREAM, not the
+  # format, so map those on top of the (usually empty) format-level tags.
+  map_meta=(-map_metadata 0)
+  [[ "${src:e:l}" == (opus|ogg|oga) ]] && map_meta+=(-map_metadata 0:s:a:0)
+  # CDJs/rekordbox only render JPEG cover art in MP3s, so re-encode any other
+  # image format into a baseline JPEG; already-JPEG art is copied bit-exact.
+  local -a art_args
+  art_args=(-c:v copy)
+  if [[ "$out_fmt" == mp3 ]]; then
+    local art_fmt
+    if [[ -n "$ART_INPUT" ]]; then
+      art_fmt="${ART_INPUT:e:l}"
+      [[ "$art_fmt" == (jpg|jpeg) ]] && art_fmt=mjpeg
+    else
+      art_fmt=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+                  -of default=nw=1:nk=1 -- "$src" 2>/dev/null)
+    fi
+    [[ -n "$art_fmt" && "$art_fmt" != mjpeg ]] && art_args=(-c:v mjpeg -q:v 2 -pix_fmt:v yuvj420p)
+  fi
   # Embed album-folder art (set by build_meta_args) only when the source has
   # none of its own.
   if [[ -n "$ART_INPUT" ]]; then
@@ -290,15 +348,15 @@ convert_file() {
   # First attempt keeps every stream (audio + embedded/folder cover art) and
   # applies the enrichment -metadata after -map_metadata so it overrides/adds.
   if ffmpeg -nostdin -hide_banner -loglevel error -y \
-        "${inputs[@]}" "${map[@]}" -map_metadata 0 "${META_ARGS[@]}" \
-        -c:a "$tgt" -c:v copy -write_id3v2 1 -f aiff "$out" 2>/dev/null; then
+        "${inputs[@]}" "${map[@]}" "${map_meta[@]}" "${META_ARGS[@]}" \
+        -c:a "$tgt" "${ENC_EXTRA[@]}" "${art_args[@]}" "${tag_args[@]}" -f "$out_fmt" "$out" 2>/dev/null; then
     return 0
   fi
-  # Fallback: audio + metadata only (drops art the AIFF muxer rejected).
+  # Fallback: audio + metadata only (drops art the muxer rejected).
   local err
   err=$(ffmpeg -nostdin -hide_banner -loglevel error -y \
-        -i "$src" -map 0:a -map_metadata 0 "${META_ARGS[@]}" \
-        -c:a "$tgt" -write_id3v2 1 -f aiff "$out" 2>&1) && { ART_DROPPED=1; return 0; }
+        -i "$src" -map 0:a "${map_meta[@]}" "${META_ARGS[@]}" \
+        -c:a "$tgt" "${ENC_EXTRA[@]}" "${tag_args[@]}" -f "$out_fmt" "$out" 2>&1) && { ART_DROPPED=1; return 0; }
   CONVERT_ERR="${err//$'\n'/ | }"
   return 1
 }
@@ -318,7 +376,7 @@ process_file() {
 
   local info codec bits fmt
   info=$(ffprobe -v error -select_streams a:0 \
-           -show_entries stream=codec_name,sample_fmt,bits_per_raw_sample \
+           -show_entries stream=codec_name,sample_fmt,sample_rate,bits_per_raw_sample \
            -of default=nw=1 -- "$src" 2>/dev/null)
   codec=$(print -r -- "$info" | awk -F= '$1=="codec_name"{print $2; exit}')
 
@@ -330,7 +388,14 @@ process_file() {
     (( skipped++ )); return
   fi
 
-  if ! is_lossless "$codec"; then
+  # Lossless sources become AIFF (bit-exact). Lossy .m4a/.opus become MP3 at
+  # a bitrate capped to the source's. Other lossy codecs are left untouched.
+  local out_fmt
+  if is_lossless "$codec"; then
+    out_fmt=aiff
+  elif [[ "$ext" == (m4a|opus) ]]; then
+    out_fmt=mp3
+  else
     log_debug "SKIP (lossy/unsupported: $codec) $src"
     (( skipped++ )); return
   fi
@@ -345,24 +410,50 @@ process_file() {
     (( skipped++ )); return
   fi
 
-  local dest="${src:r}.aiff"
+  local dest="${src:r}.$out_fmt"
   if [[ -e "$dest" && "${dest:A}" != "${src:A}" ]]; then
     print -u2 "toaiff: skip ${src:t} — ${dest:t} already exists"
     log_debug "SKIP (target exists) $src"
     (( skipped++ )); return
   fi
 
-  local tgt; tgt=$(target_codec "$bits" "$fmt")
+  local tgt label
+  ENC_EXTRA=()
+  if [[ "$out_fmt" == aiff ]]; then
+    tgt=$(target_codec "$bits" "$fmt")
+    label="$tgt"
+  else
+    tgt=libmp3lame
+    local kbps; kbps=$(mp3_bitrate_for "$(source_bitrate "$src")")
+    # -compression_level 0 = LAME's best-quality (slowest) algorithm at the
+    # chosen CBR rate.
+    ENC_EXTRA=(-b:a "${kbps}k" -compression_level 0)
+    # CDJs only play MPEG-1 Layer III rates (32/44.1/48 kHz); resample any
+    # other source rate to the nearest supported one.
+    local sr; sr=$(print -r -- "$info" | awk -F= '$1=="sample_rate"{print $2; exit}')
+    case "$sr" in
+      32000|44100|48000) ;;
+      *) if [[ "$sr" == <-> ]] && (( sr > 48000 )); then
+           ENC_EXTRA+=(-ar 48000)
+         else
+           ENC_EXTRA+=(-ar 44100)
+         fi ;;
+    esac
+    label="mp3 ${kbps}k"
+  fi
 
   # Read existing tags + art presence, then compute the fill-gaps-only
   # enrichment plan (catalog→grouping, track/disc, feat→ft, folder art).
   # Skipped entirely under --no-enrich / TOAIFF_NO_ENRICH (pure transcode).
   META_ARGS=(); META_PLAN=(); ART_INPUT=""
   if (( ENRICH )); then
-    # ffprobe prefixes format-tag keys with "TAG:" and a value can itself contain
+    # ffprobe prefixes tag keys with "TAG:" and a value can itself contain
     # "=", so match the prefixed key and keep everything after the first "=".
+    # Stream tags are included because Ogg-family sources (.opus) keep their
+    # Vorbis comments there rather than at the format level.
     local taginfo cur_track cur_disc cur_grouping cur_title has_art
-    taginfo=$(ffprobe -v error -show_entries format_tags=track,disc,grouping,title \
+    taginfo=$(ffprobe -v error \
+                -show_entries format_tags=track,disc,grouping,title:stream_tags=track,disc,grouping,title \
                 -of default=nw=1 -- "$src" 2>/dev/null)
     _tagval() { print -r -- "$taginfo" | awk -F= -v k="TAG:$1" '$1==k{print substr($0, index($0,"=")+1); exit}'; }
     cur_track=$(_tagval track)
@@ -376,27 +467,27 @@ process_file() {
 
   if (( DRYRUN )); then
     if (( ${#META_PLAN} )); then
-      print -u2 -- "toaiff: would convert ${src:t} ($tgt) [${(j: :)META_PLAN}]"
+      print -u2 -- "toaiff: would convert ${src:t} ($label) [${(j: :)META_PLAN}]"
     else
-      print -u2 -- "toaiff: would convert ${src:t} ($tgt)"
+      print -u2 -- "toaiff: would convert ${src:t} ($label)"
     fi
     (( previewed++ )); return
   fi
 
-  # ffmpeg writes the AIFF DIRECTLY to its final path — no temp file, no rename.
+  # ffmpeg writes the output DIRECTLY to its final path — no temp file, no rename.
   # A sandboxed Finder Quick Action (run by ShortcutsMacHelper) lets ffmpeg
   # CREATE files even inside TCC-protected folders, but the shell may NOT
   # rename/delete a file a child process (ffmpeg) created — which is why the
   # old "ffmpeg → temp, shell mv → dest" approach failed in Downloads/Desktop/
   # Documents. The original is trashed only after the output is verified valid.
-  if convert_file "$src" "$tgt" "$dest" && [[ -s "$dest" ]] && valid_aiff "$dest"; then
+  if convert_file "$src" "$tgt" "$dest" "$out_fmt" && [[ -s "$dest" ]] && valid_audio "$dest"; then
     trash_original "$src"
-    print -u2 -- "toaiff: converted ${src:t} → ${dest:t} ($tgt)"
+    print -u2 -- "toaiff: converted ${src:t} → ${dest:t} ($label)"
     if (( ART_DROPPED )); then
       print -u2 "toaiff: note: dropped unembeddable artwork for ${src:t}"
-      log_debug "CONVERTED (artwork dropped) $src -> $dest [$tgt]"
+      log_debug "CONVERTED (artwork dropped) $src -> $dest [$label]"
     else
-      log_debug "CONVERTED $src -> $dest [$tgt]"
+      log_debug "CONVERTED $src -> $dest [$label]"
     fi
     (( converted++ ))
   else
@@ -452,6 +543,7 @@ case "${1:-}" in
   --detect-catalog)    detect_catalog "${2:-}"; exit 0 ;;
   --derive-track-disc) derive_track_disc "${2:-}"; exit 0 ;;
   --normalize-feat)    normalize_feat "${2:-}"; exit 0 ;;
+  --mp3-bitrate)       mp3_bitrate_for "${2:-}"; exit 0 ;;
 esac
 
 ensure_tools

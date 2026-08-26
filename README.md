@@ -5,8 +5,10 @@
 ![platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
 Right-click lossless audio in Finder and convert it to **AIFF** — no quality
-loss, all artwork and metadata preserved, originals moved to the Trash. Works on
-a single file, a selection, or a whole folder (recursing into subfolders). Lossy
+loss, all artwork and metadata preserved, originals moved to the Trash. Lossy
+`.m4a` (AAC) and `.opus` files convert to **MP3** instead, at the highest
+bitrate that doesn't exceed the source's (never inflated). Works on a single
+file, a selection, or a whole folder (recursing into subfolders). Other lossy
 and non-audio files are left untouched.
 
 It also **enriches** the ID3 tags as it converts — backfilling a catalog number,
@@ -17,8 +19,9 @@ normalizing `feat.`→`ft.` — without ever overwriting tags the source already
 
 > [!IMPORTANT]
 > Originals are moved to the **Trash** (recoverable), never hard-deleted, and
-> only **after** the new `.aiff` is verified readable. A failed conversion never
-> loses the source. Still, try it on a copy first if you're cautious.
+> only **after** the new `.aiff`/`.mp3` is verified readable. A failed
+> conversion never loses the source. Still, try it on a copy first if you're
+> cautious.
 
 ## Requirements
 
@@ -77,15 +80,17 @@ toaiff --version
 
 ## What gets converted
 
-Conversion is decided by the actual audio **codec**, not the file extension, so
-a `.m4a` holding ALAC is converted while a `.m4a` holding AAC is skipped.
+Conversion is decided by the actual audio **codec**, not just the file
+extension, so a `.m4a` holding ALAC converts losslessly to AIFF while a `.m4a`
+holding AAC takes the MP3 path.
 
 | Input | Action |
 |-------|--------|
 | FLAC, ALAC, WavPack, Monkey's Audio (APE), TAK, TTA, MLP/TrueHD | convert → AIFF |
 | WAV / raw PCM | convert → AIFF (uncompressed passthrough) |
 | Already AIFF | skipped |
-| MP3, AAC, Vorbis, Opus, AC3, WMA, … (lossy) | skipped |
+| Lossy `.m4a` (AAC), `.opus` | convert → MP3 (bitrate capped at the source's) |
+| MP3, Vorbis, AC3, WMA, … (other lossy) | skipped |
 | DSD (`.dsf`/`.dff`) | skipped (no clean lossless PCM mapping) |
 | Non-audio files | ignored |
 
@@ -107,6 +112,27 @@ Sample rate and channel layout are never touched (no resampling). Tags and
 embedded cover art are carried over via `-map_metadata` and an ID3v2 chunk; if
 the AIFF container rejects an embedded image, the audio still converts and the
 artwork is dropped with a logged note.
+
+### Lossy `.m4a` / `.opus` → MP3
+
+A lossy source can't become lossless again, so re-encoding it at a *higher*
+bitrate would only waste space. `toaiff` reads the source's real bitrate and
+picks the **highest standard MP3 CBR rate that doesn't exceed it** (320 kbps
+max, LAME's best-quality algorithm): a 256 kbps AAC becomes a 256 kbps MP3, a
+96 kbps Opus never becomes a 320 kbps MP3. If the source bitrate is unknown,
+MP3's maximum (320 kbps) is used. All tags — including Opus's stream-level
+Vorbis comments — and embedded or folder cover art carry over, and the same
+enrichment applies as on the AIFF path.
+
+The output is deliberately the most **CDJ/rekordbox-compatible** MP3 possible:
+
+- **CBR**, never VBR — VBR seeking is unreliable on older CDJ firmware
+- **ID3v2.3** tags — the version Pioneer hardware reads most reliably
+- **JPEG cover art** — CDJs ignore PNG APIC frames, so any non-JPEG art
+  (embedded or folder) is re-encoded to baseline JPEG
+- **32 / 44.1 / 48 kHz only** (MPEG-1 Layer III) — an off-spec source rate
+  (e.g. 22.05 kHz) is resampled to the nearest supported rate; standard-rate
+  sources are never resampled
 
 ## Metadata enrichment
 
