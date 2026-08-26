@@ -26,11 +26,17 @@ if [[ -e "$legacy" ]]; then
 fi
 
 # The tool was called toaiff before it also produced MP3. Retire the old binary
-# so `toaiff` doesn't linger on PATH shadowing nothing.
+# so `toaiff` doesn't linger on PATH shadowing nothing. An already-imported
+# Quick Action still runs `toaiff`, so it breaks until the user re-imports —
+# say so loudly rather than letting right-click fail silently.
 legacy_bin="$bin_dir/toaiff"
 if [[ -e "$legacy_bin" ]]; then
   rm -f "$legacy_bin"
   echo "removed previous install: $legacy_bin (now: $bin_dir/decant)"
+  echo
+  echo "ACTION NEEDED: your existing Finder Quick Action still runs 'toaiff' and"
+  echo "will now fail. Re-import shortcut/Decant.shortcut, then delete the old"
+  echo "\"→ aiff\" shortcut in Shortcuts.app. See README ▸ \"Upgrading from toaiff\"."
 fi
 
 echo

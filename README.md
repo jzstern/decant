@@ -8,13 +8,15 @@ Right-click audio in Finder and pour it into the format your gear actually
 wants — without disturbing what's inside. Lossless files become **AIFF** with
 no quality loss; lossy `.m4a` (AAC) and `.opus` files become CDJ-ready **MP3**
 at the highest bitrate that doesn't exceed the source's (never inflated).
-Artwork and metadata are preserved throughout, and originals move to the Trash.
-Works on a single file, a selection, or a whole folder (recursing into
-subfolders). Other lossy and non-audio files are left untouched.
+Metadata is preserved, artwork carries over wherever the target format accepts
+it, and originals move to the Trash. Works on a single file, a selection, or a
+whole folder (recursing into subfolders). Other lossy and non-audio files are
+left untouched.
 
 It also **enriches** the ID3 tags as it converts — backfilling a catalog number,
-track/disc numbers, and folder artwork from the file/folder names, and
-normalizing `feat.`→`ft.` — without ever overwriting tags the source already has.
+track/disc numbers, and folder artwork from the file/folder names. Backfilling
+never overwrites a tag the source already has; the one exception is normalizing
+`feat.`→`ft.`, which edits the title in place.
 
 <!-- TODO: demo.gif — right-click ▸ Quick Actions ▸ Decant, then the notification -->
 
@@ -68,6 +70,18 @@ bundled Shortcut yourself. It takes about a minute:
 
 It works in protected folders (Desktop / Documents / Downloads) with **no Full
 Disk Access needed** — see [How it works](#how-it-works).
+
+### Upgrading from `toaiff`
+
+This tool used to be called `toaiff`, and its Quick Action was named **→ aiff**.
+That shortcut runs `toaiff`, which no longer exists — so after upgrading, the
+right-click action fails until you replace it:
+
+1. Add the new Quick Action using the steps above.
+2. Delete the old **→ aiff** shortcut in Shortcuts.app.
+
+Two other things moved: every `TOAIFF_*` environment variable is now `DECANT_*`,
+and the log lives at `~/Library/Logs/decant.log` instead of `toaiff.log`.
 
 ## Use from the terminal
 
