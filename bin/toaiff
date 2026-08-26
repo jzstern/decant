@@ -132,23 +132,30 @@ target_codec() {
   fi
 }
 
-# Echo the source audio bitrate in bps — the stream's own value when ffprobe
-# knows it, else the container average (Opus files usually only report the
-# latter) — or nothing when neither is available.
+# Echo the source audio bitrate in bps, or nothing when it cannot be measured.
+# Uses the stream's own value when ffprobe knows it; otherwise (Ogg/Opus never
+# stores one) sums the audio packet sizes — NOT the container average, which
+# counts tags and artwork and would overstate the real audio bitrate.
 source_bitrate() {
   local br
   br=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate \
          -of default=nw=1:nk=1 -- "$1" 2>/dev/null)
-  if [[ -z "$br" || "$br" == "N/A" ]]; then
-    br=$(ffprobe -v error -show_entries format=bit_rate \
-           -of default=nw=1:nk=1 -- "$1" 2>/dev/null)
+  if [[ "$br" != <-> ]]; then
+    local dur
+    dur=$(ffprobe -v error -show_entries format=duration \
+            -of default=nw=1:nk=1 -- "$1" 2>/dev/null)
+    br=$(ffprobe -v error -select_streams a:0 -show_entries packet=size \
+           -of csv=p=0 -- "$1" 2>/dev/null |
+         awk -v dur="$dur" 'NF{s+=$1} END{if (s>0 && dur+0>0) printf "%d", s*8/dur}')
   fi
   [[ "$br" == <-> ]] && print -r -- "$br"
 }
 
 # Highest standard MP3 CBR bitrate (kbps) that does not exceed the source
 # bitrate, so a lossy source is never inflated past its real quality. An
-# unknown source bitrate gets the best MP3 can do (320).
+# unknown source bitrate gets the best MP3 can do (320). The one exception to
+# the cap: 32 kbps is MPEG-1 Layer III's minimum, so anything below that
+# encodes at 32.
 mp3_bitrate_for() {
   local bps="$1" r
   if [[ -n "$bps" ]]; then
@@ -393,7 +400,7 @@ process_file() {
   local out_fmt
   if is_lossless "$codec"; then
     out_fmt=aiff
-  elif [[ "$ext" == (m4a|opus) ]]; then
+  elif [[ "$ext" == opus || ( "$ext" == m4a && "$codec" == aac ) ]]; then
     out_fmt=mp3
   else
     log_debug "SKIP (lossy/unsupported: $codec) $src"
@@ -428,8 +435,8 @@ process_file() {
     # -compression_level 0 = LAME's best-quality (slowest) algorithm at the
     # chosen CBR rate.
     ENC_EXTRA=(-b:a "${kbps}k" -compression_level 0)
-    # CDJs only play MPEG-1 Layer III rates (32/44.1/48 kHz); resample any
-    # other source rate to the nearest supported one.
+    # CDJs only play MPEG-1 Layer III rates (32/44.1/48 kHz); off-spec source
+    # rates resample to 44.1 kHz (48 kHz when the source is above 48 kHz).
     local sr; sr=$(print -r -- "$info" | awk -F= '$1=="sample_rate"{print $2; exit}')
     case "$sr" in
       32000|44100|48000) ;;

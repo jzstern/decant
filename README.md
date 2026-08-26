@@ -120,8 +120,9 @@ bitrate would only waste space. `toaiff` reads the source's real bitrate and
 picks the **highest standard MP3 CBR rate that doesn't exceed it** (320 kbps
 max, LAME's best-quality algorithm): a 256 kbps AAC becomes a 256 kbps MP3, a
 96 kbps Opus never becomes a 320 kbps MP3. If the source bitrate is unknown,
-MP3's maximum (320 kbps) is used. All tags — including Opus's stream-level
-Vorbis comments — and embedded or folder cover art carry over, and the same
+MP3's maximum (320 kbps) is used; a source below MP3's 32 kbps floor encodes
+at 32 (the format's minimum). All tags — including Opus's stream-level Vorbis
+comments — and embedded or folder cover art carry over, and the same
 enrichment applies as on the AIFF path.
 
 The output is deliberately the most **CDJ/rekordbox-compatible** MP3 possible:
@@ -131,8 +132,8 @@ The output is deliberately the most **CDJ/rekordbox-compatible** MP3 possible:
 - **JPEG cover art** — CDJs ignore PNG APIC frames, so any non-JPEG art
   (embedded or folder) is re-encoded to baseline JPEG
 - **32 / 44.1 / 48 kHz only** (MPEG-1 Layer III) — an off-spec source rate
-  (e.g. 22.05 kHz) is resampled to the nearest supported rate; standard-rate
-  sources are never resampled
+  (e.g. 22.05 kHz) is resampled to 44.1 kHz (48 kHz for sources above 48 kHz);
+  standard-rate sources are never resampled
 
 ## Metadata enrichment
 

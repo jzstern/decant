@@ -60,6 +60,10 @@ ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=620:dur
   -metadata title="Opus Meta" "$WORK/voice.opus"
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=630:duration=2" -ar 22050 -c:a aac -b:a 48k \
   "$WORK/lofi.m4a"
+# Same audio packets as voice.opus but with a huge tag — the container-average
+# bitrate is inflated, the audio-only measurement must not be.
+ffmpeg -nostdin -hide_banner -loglevel error -i "$WORK/voice.opus" -map 0:a -c copy \
+  -metadata title="${(l:131072::x:)}" "$WORK/padded.opus"
 print -r -- "not audio" > "$WORK/readme.txt"
 : > "$WORK/corrupt.flac"   # 0-byte file with a lossless extension
 # A text file whose extension (.al) ffmpeg would otherwise mis-detect as raw
@@ -133,6 +137,9 @@ OPUS_BR="$(probe -show_entries format=bit_rate -of default=nw=1:nk=1 -- "$WORK/v
 OMP3_BR="$(probe -select_streams a:0 -show_entries stream=bit_rate -of default=nw=1:nk=1 -- "$WORK/voice.mp3")"
 assert_true "MP3 bitrate does not exceed the opus source (no upscaling)" \
             test "${OMP3_BR:-999999999}" -le "${OPUS_BR:-0}"
+assert_eq   "tag-padded opus gets the same cap as its identical-audio twin" \
+            "$OMP3_BR" \
+            "$(probe -select_streams a:0 -show_entries stream=bit_rate -of default=nw=1:nk=1 -- "$WORK/padded.mp3")"
 assert_true "ALAC .m4a still becomes AIFF (lossless path unchanged)" \
             test -f "$WORK/alactrack.aiff"
 assert_true "ALAC .m4a does not get an MP3" \
