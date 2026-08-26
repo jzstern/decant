@@ -15,7 +15,7 @@
 emulate -L zsh
 setopt pipefail extended_glob
 
-TOAIFF_VERSION="0.1.0"
+TOAIFF_VERSION="0.2.0"
 
 # GUI-launched processes (Finder Quick Action / Automator) inherit a minimal
 # PATH that omits Homebrew, so ffmpeg/ffprobe/brew would be invisible. Make the
