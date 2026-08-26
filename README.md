@@ -22,9 +22,10 @@ never overwrites a tag the source already has; the one exception is normalizing
 
 > [!IMPORTANT]
 > Originals are moved to the **Trash** (recoverable), never hard-deleted, and
-> only **after** the new `.aiff`/`.mp3` is verified readable. A failed
-> conversion never loses the source. Still, try it on a copy first if you're
-> cautious.
+> only **after** the new `.aiff`/`.mp3` is verified readable. A failed or
+> interrupted conversion never loses the source, and if an original can't be
+> trashed you're told rather than left guessing. Still, try it on a copy first
+> if you're cautious.
 
 ## Requirements
 
@@ -249,6 +250,28 @@ ffmpeg writes the `.aiff`/`.mp3` directly to its final path, and the original is
 trashed only after the output is verified to be readable audio. On any failure
 the original is left exactly as it was.
 
+### Interrupting a run
+
+Because there is no temp-file stage, a run killed mid-encode would otherwise
+leave a half-written file sitting at the destination. `decant` traps `INT`,
+`TERM` and `HUP`, discards whatever ffmpeg was writing, and exits `128 + signal`
+— nothing else in the folder is touched, and the source is still there.
+
+If a stub survives anyway (a power cut, `kill -9`), the next run notices the
+existing destination isn't readable audio, says so on stderr, logs it, and
+re-converts over it — so a single bad interruption can't block a file forever.
+A destination that *is* valid audio is still skipped as before; one that turns
+out to be a **directory** is reported as a failure and left untouched.
+
+### Trashing originals
+
+Originals go to the Trash via `NSFileManager`, which uniquifies names itself.
+The direct `~/.Trash` fallback (used when that call fails, and for files on
+external volumes) picks a free name Finder-style — `01 - Intro 2.flac` — so a
+same-named track from another album never overwrites one already in there. If
+trashing fails outright, the conversion is still counted as a success, but a
+warning and a `TRASH FAILED` log line make clear the original stayed put.
+
 <details>
 <summary>Why it works in protected folders without Full Disk Access</summary>
 
@@ -300,6 +323,8 @@ conversion.
 | — | `DECANT_NO_NOTIFY` | Suppress the completion notification even with `--notify`. |
 | — | `DECANT_NO_SOXR` | Resample with ffmpeg's default engine instead of libsoxr. |
 | — | `DECANT_LOG` | Override the log file path (used by the test suite). |
+| — | `DECANT_TRASH_DIR` | Override the directory the `~/.Trash` fallback moves originals into (used by the test suite). |
+| — | `DECANT_FORCE_TRASH_FALLBACK` | Skip `NSFileManager` and always take the `~/.Trash` fallback (used by the test suite). |
 
 ### Exit codes
 
@@ -316,6 +341,7 @@ conventional [sysexits](https://man.freebsd.org/cgi/man.cgi?sysexits) codes.
 | `66` | A given path does not exist. |
 | `69` | ffmpeg/ffprobe are unavailable and were not installed. |
 | `77` | Refused a path that is too broad to recurse (a filesystem or home root). |
+| `130` | Interrupted by a signal — `128 + signal`, so `143` for `TERM`, `129` for `HUP`. |
 
 When one run hits several of these, the most severe wins: `1` over `77` over
 `66`. So a script or Shortcut can branch on `decant … || handle "$?"` and trust
@@ -347,11 +373,14 @@ Issues and PRs welcome. Run the test suite before submitting:
 It generates fixtures with ffmpeg and exercises depth preservation, bitrate
 capping, metadata and artwork retention, codec classification, stream mapping,
 `ffmpeg` resolution and its bootstrap, enrichment + decoy rejection, recursion,
-skipping, logging and its rotation, and the CLI contract (exit codes, flag
-parsing). CI runs the same suite on every PR.
+skipping, logging and its rotation, the CLI contract (exit codes, flag
+parsing), interrupt cleanup, recovery from a stranded destination, and Trash
+uniquification. CI runs the same suite on every PR.
 
 Almost every assertion runs with `DECANT_KEEP_ORIGINALS` set, so nothing of
-yours is touched. The exception is the one test that proves `--keep` is what
+yours is touched; the trash-fallback tests do move fixtures, but
+`DECANT_TRASH_DIR` sends them to a throwaway folder rather than your real
+`~/.Trash`. The exception is the one test that proves `--keep` is what
 preserves an original: it lets decant trash a fixture for real, which leaves a
 single recoverable `decant-selftest-trashme.flac` in your Trash.
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env zsh
 #
 # Behavioural tests for decant. Non-destructive: DECANT_KEEP_ORIGINALS keeps
-# source files in place (no Trash side effects) and DECANT_LOG redirects the
-# log away from ~/Library/Logs. Requires ffmpeg/ffprobe.
+# source files in place and DECANT_LOG redirects the log away from
+# ~/Library/Logs. The trash-fallback tests do move fixtures, but
+# DECANT_TRASH_DIR points them at a throwaway folder inside $WORK, never the
+# real ~/.Trash. Requires ffmpeg/ffprobe.
 
 emulate -L zsh
 
@@ -1142,6 +1144,162 @@ assert_true "...and says what to run instead" \
   script -q /dev/null "$NT/decant" "$NT/t.flac" > "$NT/tty-y.out" 2>&1
 assert_true "answering yes is what actually runs brew install" \
             test -e "$NT/called-tty-y"
+
+print -r -- "interrupt: a killed run leaves no debris at the destination"
+# #given a source long enough that ffmpeg is still encoding when the signal
+# lands — LAME at -compression_level 0 needs ~10s for this one, and the poll
+# below fires within ~50ms of the destination appearing.
+KI="$WORK/interrupt"; mkdir -p "$KI"
+KLOG="$WORK/kill.log"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=300" \
+  -c:a libopus -b:a 96k "$KI/long.opus"
+# Bystanders in the same folder: the handler must only ever touch the file
+# ffmpeg is writing right now.
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=470:duration=1" \
+  -c:a pcm_s16be "$KI/bystander.aiff"
+print -r -- "keep me" > "$KI/bystander.txt"
+
+# #when the run is signalled the way Ctrl-C does it — the script AND the ffmpeg
+# it is blocked on, because zsh defers a trap until its foreground child returns.
+kill_mid_encode() {
+  local sig="$1" pid i
+  local -a kids
+  : > "$KLOG"
+  rm -f "$KI/long.mp3"
+  DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$KLOG" "$DECANT" "$KI/long.opus" >/dev/null 2>&1 &
+  pid=$!
+  for i in {1..600}; do [[ -e "$KI/long.mp3" ]] && break; sleep 0.05; done
+  kill -$sig $pid 2>/dev/null
+  kids=($(pgrep -P $pid 2>/dev/null))
+  (( ${#kids} )) && kill -$sig $kids 2>/dev/null
+  wait $pid
+}
+
+kill_mid_encode TERM
+KRC=$?
+assert_true "SIGTERM mid-encode removes the half-written output" \
+            test ! -e "$KI/long.mp3"
+assert_eq   "…and exits 128+SIGTERM" "143" "$KRC"
+assert_true "…leaving the source untouched" \
+            test -f "$KI/long.opus"
+assert_true "…and recording the interruption in the log (error tier)" \
+            grep -q "INTERRUPTED (TERM)" "$KLOG"
+assert_true "…without touching an unrelated sibling AIFF" \
+            test -f "$KI/bystander.aiff"
+assert_true "…or an unrelated non-audio sibling" \
+            test -f "$KI/bystander.txt"
+
+kill_mid_encode INT
+KRC=$?
+assert_true "SIGINT mid-encode removes the half-written output too" \
+            test ! -e "$KI/long.mp3"
+assert_eq   "…and exits 128+SIGINT" "130" "$KRC"
+assert_true "…and logs the interruption" \
+            grep -q "INTERRUPTED (INT)" "$KLOG"
+
+print -r -- "recovery: an unusable pre-existing destination is re-converted"
+# #given every shape of leftover a killed run can leave behind, plus a valid
+# destination that must keep today's skip behaviour
+RE="$WORK/recover"; mkdir -p "$RE/dirdest.aiff"
+RLOG="$WORK/recover.log"
+gen_flac() {
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=$2:duration=1" \
+    -c:a flac "$1"
+}
+RWEIRD="-odd 'quo\"ted Ünïcode ᴥ"
+gen_flac "$RE/stub.flac" 440
+print -r -- "this is not audio" > "$RE/stub.aiff"
+gen_flac "$RE/empty.flac" 450
+: > "$RE/empty.aiff"
+gen_flac "$RE/good.flac" 460
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=470:duration=1" \
+  -c:a pcm_s16be "$RE/good.aiff"
+gen_flac "$RE/dirdest.flac" 480
+gen_flac "$RE/$RWEIRD.flac" 490
+print -r -- "debris" > "$RE/$RWEIRD.aiff"
+GOODSUM="$(shasum -a 256 "$RE/good.aiff" | cut -d' ' -f1)"
+
+ROUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$RLOG" "$DECANT" "$RE" 2>&1)"
+RRC=$?
+assert_eq   "an invalid leftover is replaced with real audio" "pcm_s16be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$RE/stub.aiff")"
+assert_true "…and says why, instead of skipping silently forever" \
+            grep -q "stub.aiff exists but is not valid audio" <<< "$ROUT"
+assert_true "…and logs it without --debug (error tier)" \
+            grep -q "RECOVER (unusable target).*stub.flac" "$RLOG"
+assert_eq   "a zero-length leftover is recovered the same way" "pcm_s16be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$RE/empty.aiff")"
+assert_eq   "spaces/quotes/unicode/leading-dash names recover too" "pcm_s16be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$RE/$RWEIRD.aiff")"
+assert_eq   "a VALID destination is still skipped, byte-for-byte" "$GOODSUM" \
+            "$(shasum -a 256 "$RE/good.aiff" | cut -d' ' -f1)"
+assert_true "…and still reports the plain 'already exists' skip" \
+            grep -q "skip good.flac — good.aiff already exists" <<< "$ROUT"
+assert_true "a destination that is a directory is never discarded" \
+            test -d "$RE/dirdest.aiff"
+assert_true "…and its source is left in place" \
+            test -f "$RE/dirdest.flac"
+assert_true "…reported as a failure rather than debris" \
+            grep -q "dirdest.aiff exists and is a directory" <<< "$ROUT"
+assert_true "…and logged" \
+            grep -q "target exists as a directory" "$RLOG"
+assert_eq   "the run exits non-zero because of that one failure" "1" "$RRC"
+
+print -r -- "trash fallback: uniquifies instead of overwriting an earlier entry"
+# #given same-named tracks from different albums, all trashed via the fallback
+# (DECANT_TRASH_DIR keeps the real ~/.Trash out of it)
+TB="$WORK/trash-src"; TBIN="$WORK/trash-bin"
+mkdir -p "$TB/Album A" "$TB/Album B" "$TB/Album C" "$TBIN"
+TWEIRD="-lead 'quo\"ted Ünïcode ᴥ"
+for a in A B C; do
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=1" \
+    -c:a flac "$TB/Album $a/01 - Intro.flac"
+done
+for a in A B; do
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=450:duration=1" \
+    -c:a flac "$TB/Album $a/$TWEIRD.flac"
+done
+DECANT_FORCE_TRASH_FALLBACK=1 DECANT_TRASH_DIR="$TBIN" DECANT_LOG="$LOG" \
+  "$DECANT" "$TB" >/dev/null 2>&1
+assert_true "the first original keeps its own name in the Trash" \
+            test -f "$TBIN/01 - Intro.flac"
+assert_true "the second is uniquified Finder-style (' 2')" \
+            test -f "$TBIN/01 - Intro 2.flac"
+assert_true "the third gets ' 3' — still nothing overwritten" \
+            test -f "$TBIN/01 - Intro 3.flac"
+assert_eq   "all three same-named originals survive in the Trash" "3" \
+            "$(ls "$TBIN" | grep -c '^01 - Intro')"
+assert_true "a spaces/quotes/unicode/leading-dash name trashes intact" \
+            test -f "$TBIN/$TWEIRD.flac"
+assert_true "…and its same-named twin is uniquified, not clobbered" \
+            test -f "$TBIN/$TWEIRD 2.flac"
+assert_eq   "every original left its album folder" "0" \
+            "$(find "$TB" -name '*.flac' | wc -l | tr -d ' ')"
+assert_eq   "…and every one produced an AIFF" "5" \
+            "$(find "$TB" -name '*.aiff' | wc -l | tr -d ' ')"
+
+print -r -- "trash failure: warns, logs, and leaves the original in place"
+# #given a Trash directory that does not exist, so the fallback cannot move
+TF="$WORK/trash-fail"; mkdir -p "$TF"
+FLOG="$WORK/trashfail.log"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=460:duration=1" \
+  -c:a flac "$TF/01 - Keep.flac"
+FOUT="$(DECANT_FORCE_TRASH_FALLBACK=1 DECANT_TRASH_DIR="$WORK/no-such-trash" \
+        DECANT_LOG="$FLOG" "$DECANT" "$TF" 2>&1)"
+FRC=$?
+assert_true "the conversion is still reported as converted" \
+            grep -q "converted 01 - Keep.flac" <<< "$FOUT"
+assert_true "a warning says the original was left behind" \
+            grep -q "could not move 01 - Keep.flac to the Trash" <<< "$FOUT"
+assert_true "the original really is still there" \
+            test -f "$TF/01 - Keep.flac"
+assert_eq   "the output is valid audio all the same" "pcm_s16be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$TF/01 - Keep.aiff")"
+assert_true "the failure is logged without --debug (error tier)" \
+            grep -q "TRASH FAILED" "$FLOG"
+assert_eq   "the run still exits 0 — the conversion succeeded" "0" "$FRC"
+assert_eq   "…and the summary still counts it as converted" "decant: 1 converted" \
+            "$(tail -1 <<< "$FOUT")"
 
 rm -rf "$WORK"
 
