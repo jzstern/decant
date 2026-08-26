@@ -10,6 +10,33 @@ DECANT="${0:A:h}/../bin/decant"
 typeset -i pass=0 fail=0
 
 probe() { ffprobe -v error "$@" 2>/dev/null }
+duration_s() { probe -show_entries format=duration -of default=nw=1:nk=1 -- "$1" }
+decode_errors() { ffmpeg -nostdin -hide_banner -v error -i "$1" -f null - 2>&1 }
+
+# Decoded-audio fingerprint, normalised to one PCM layout so a 24-bit FLAC and
+# the AIFF made from it hash identically iff every sample is identical. Proves
+# bit-exactness, which a matching codec_name alone does not.
+pcm_md5() {
+  ffmpeg -nostdin -hide_banner -v error -i "$1" -map 0:a -c:a pcm_s32le -f md5 - 2>/dev/null
+}
+
+# Mean spectral centroid in Hz. A test tone that came through a rate conversion
+# intact keeps its pitch; a botched one shifts it, however right the header says
+# the sample rate is.
+centroid_hz() {
+  ffmpeg -nostdin -hide_banner -v error -i "$1" \
+    -af "aspectralstats=win_size=2048,ametadata=print:key=lavfi.aspectralstats.1.centroid:file=-" \
+    -f null - 2>/dev/null |
+    awk -F= '/centroid/{s+=$2; n++} END{if (n) printf "%d", s/n}'
+}
+
+peak_db() {
+  ffmpeg -nostdin -hide_banner -nostats -i "$1" -af volumedetect -f null - 2>&1 |
+    awk -F'max_volume: ' '/max_volume/{print $2+0; exit}'
+}
+
+# Fails on an empty value too, so a silently missing measurement can't pass.
+in_range() { awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN{exit !(v != "" && v+0 >= lo && v+0 <= hi)}' }
 
 assert_eq() {
   # #then compare actual to expected for one logical assertion
@@ -47,6 +74,15 @@ gen_flac24_with_art() {
   rm -f "$WORK/_t.flac" "$WORK/_a.png"
 }
 
+gen_lofi_m4a_with_art() {
+  ffmpeg -nostdin -hide_banner -loglevel error \
+    -f lavfi -i "sine=frequency=630:duration=2" -ar 22050 -c:a aac -b:a 64k "$WORK/_l.m4a"
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "color=c=red:s=40x40:d=1" -frames:v 1 "$WORK/_l.png"
+  ffmpeg -nostdin -hide_banner -loglevel error -i "$WORK/_l.m4a" -i "$WORK/_l.png" \
+    -map 0:a -map 1:v -c copy -disposition:v attached_pic "$WORK/artlofi.m4a"
+  rm -f "$WORK/_l.m4a" "$WORK/_l.png"
+}
+
 gen_flac24_with_art
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=220:duration=1" -c:a pcm_s16le "$WORK/sub/tone16.wav"
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=300:duration=1" -c:a pcm_s24le \
@@ -60,6 +96,18 @@ ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=620:dur
   -metadata title="Opus Meta" "$WORK/voice.opus"
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=630:duration=2" -ar 22050 -c:a aac -b:a 48k \
   "$WORK/lofi.m4a"
+# Above MPEG-1 Layer III's ceiling — must land on 48kHz, not 44.1.
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=640:duration=2" -ar 96000 -c:a aac -b:a 160k \
+  "$WORK/hires.m4a"
+# Already on a Layer III rate — must not be resampled at all.
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=650:duration=2" -ar 32000 -c:a aac -b:a 96k \
+  "$WORK/std32.m4a"
+# Off-spec rate AND embedded art — the resampling filter must not disturb the
+# attached picture riding alongside the audio.
+gen_lofi_m4a_with_art
+# 96kHz lossless: the AIFF path never resamples, whatever the source rate.
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=660:duration=1" -ar 96000 \
+  -sample_fmt s32 -bits_per_raw_sample 24 -c:a flac "$WORK/hires96.flac"
 # Same audio packets as voice.opus but with a huge tag — the container-average
 # bitrate is inflated, the audio-only measurement must not be.
 ffmpeg -nostdin -hide_banner -loglevel error -i "$WORK/voice.opus" -map 0:a -c copy \
@@ -150,6 +198,81 @@ assert_eq   "48kHz opus keeps its native rate (48k is CDJ-supported)" "48000" \
             "$(probe -select_streams a:0 -show_entries stream=sample_rate -of default=nw=1:nk=1 -- "$WORK/voice.mp3")"
 assert_eq   "22.05kHz m4a is resampled to 44.1kHz for CDJ playback" "44100" \
             "$(probe -select_streams a:0 -show_entries stream=sample_rate -of default=nw=1:nk=1 -- "$WORK/lofi.mp3")"
+assert_eq   "96kHz m4a is resampled down to 48kHz, not 44.1kHz" "48000" \
+            "$(probe -select_streams a:0 -show_entries stream=sample_rate -of default=nw=1:nk=1 -- "$WORK/hires.mp3")"
+assert_eq   "32kHz m4a keeps its native rate (32k is CDJ-supported)" "32000" \
+            "$(probe -select_streams a:0 -show_entries stream=sample_rate -of default=nw=1:nk=1 -- "$WORK/std32.mp3")"
+
+print -r -- "resampler selection (soxr when the ffmpeg build has it, default otherwise)"
+assert_eq   "44.1kHz source asks for no resampling options at all" "" \
+            "$("$DECANT" --resample-args 44100)"
+assert_eq   "48kHz source asks for none either" "" "$("$DECANT" --resample-args 48000)"
+assert_eq   "32kHz source asks for none either" "" "$("$DECANT" --resample-args 32000)"
+# libsoxr is an optional ffmpeg build dependency (Homebrew's bottle ships
+# without it), and `-h filter=aresample` advertises soxr either way — so assert
+# whichever branch THIS build genuinely takes. Both must be exactly right: a
+# wrong -af here fails every off-spec conversion outright.
+RS22="$("$DECANT" --resample-args 22050)"
+RS96="$("$DECANT" --resample-args 96000)"
+if [[ "$RS22" == *soxr* ]]; then
+  assert_eq "off-spec rate uses soxr at precision 28 (this build has libsoxr)" \
+            "-ar 44100 -af aresample=resampler=soxr:precision=28" "$RS22"
+  assert_eq "above-48k rate uses soxr too" \
+            "-ar 48000 -af aresample=resampler=soxr:precision=28" "$RS96"
+else
+  assert_eq "off-spec rate falls back to the default resampler (no libsoxr here)" \
+            "-ar 44100" "$RS22"
+  assert_eq "above-48k rate falls back the same way" "-ar 48000" "$RS96"
+fi
+assert_eq   "a soxr-less ffmpeg still gets a plain -ar (never a broken filter)" \
+            "-ar 44100" "$(DECANT_NO_SOXR=1 "$DECANT" --resample-args 22050)"
+
+print -r -- "resampled output is real audio, not just a retagged header"
+assert_eq   "22.05->44.1kHz MP3 decodes with no errors" "" \
+            "$(decode_errors "$WORK/lofi.mp3")"
+assert_true "22.05->44.1kHz MP3 keeps the 2s source duration (no speed change)" \
+            in_range "$(duration_s "$WORK/lofi.mp3")" 1.95 2.15
+assert_true "the 630Hz test tone survives the resample (pitch unchanged)" \
+            in_range "$(centroid_hz "$WORK/lofi.mp3")" 540 720
+assert_true "resampled output is audible, not silence" \
+            in_range "$(peak_db "$WORK/lofi.mp3")" -40 0
+assert_eq   "96->48kHz MP3 decodes with no errors" "" \
+            "$(decode_errors "$WORK/hires.mp3")"
+assert_true "96->48kHz MP3 keeps the 2s source duration" \
+            in_range "$(duration_s "$WORK/hires.mp3")" 1.95 2.15
+assert_true "the 640Hz test tone survives the downsample" \
+            in_range "$(centroid_hz "$WORK/hires.mp3")" 550 730
+assert_eq   "an off-spec source with embedded art still resamples" "44100" \
+            "$(probe -select_streams a:0 -show_entries stream=sample_rate -of default=nw=1:nk=1 -- "$WORK/artlofi.mp3")"
+assert_eq   "...and keeps its cover art through the filter graph" "mjpeg" \
+            "$(probe -select_streams v -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$WORK/artlofi.mp3")"
+
+print -r -- "graceful fallback when libsoxr is unavailable"
+NS="$WORK/nosoxr"; mkdir -p "$NS"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=630:duration=2" -ar 22050 -c:a aac -b:a 48k \
+  "$NS/lofi.m4a"
+DECANT_NO_SOXR=1 DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$NS" >/dev/null 2>&1
+assert_true "the conversion still happens without soxr" \
+            test -f "$NS/lofi.mp3"
+assert_eq   "...still lands on exactly 44.1kHz" "44100" \
+            "$(probe -select_streams a:0 -show_entries stream=sample_rate -of default=nw=1:nk=1 -- "$NS/lofi.mp3")"
+assert_eq   "...and is still valid audio" "" "$(decode_errors "$NS/lofi.mp3")"
+assert_true "...of the right duration" \
+            in_range "$(duration_s "$NS/lofi.mp3")" 1.95 2.15
+
+print -r -- "AIFF path stays bit-exact (decoded samples, not just codec names)"
+assert_true "the PCM fingerprint is a real measurement, not an empty string" \
+            test -n "$(pcm_md5 "$WORK/album24.aiff")"
+assert_eq   "24-bit FLAC -> AIFF decodes to byte-identical PCM" \
+            "$(pcm_md5 "$WORK/album24.flac")" "$(pcm_md5 "$WORK/album24.aiff")"
+assert_eq   "16-bit WAV -> AIFF decodes to byte-identical PCM" \
+            "$(pcm_md5 "$WORK/sub/tone16.wav")" "$(pcm_md5 "$WORK/sub/tone16.aiff")"
+assert_eq   "96kHz FLAC keeps its rate (the AIFF path never resamples)" "96000" \
+            "$(probe -select_streams a:0 -show_entries stream=sample_rate -of default=nw=1:nk=1 -- "$WORK/hires96.aiff")"
+assert_eq   "96kHz FLAC -> AIFF is bit-exact as well" \
+            "$(pcm_md5 "$WORK/hires96.flac")" "$(pcm_md5 "$WORK/hires96.aiff")"
+assert_eq   "44.1kHz FLAC -> AIFF keeps its rate too" "44100" \
+            "$(probe -select_streams a:0 -show_entries stream=sample_rate -of default=nw=1:nk=1 -- "$WORK/album24.aiff")"
 
 print -r -- "mp3 bitrate cap (highest standard rate ≤ source, 320 max)"
 assert_eq   "unknown source bitrate -> 320" "320" "$("$DECANT" --mp3-bitrate '')"
@@ -272,6 +395,120 @@ assert_eq   "track backfilled into the MP3 too" "3" \
             "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$ENC")"
 assert_eq   "folder art embedded into the MP3 as JPEG (CDJs ignore PNG APIC)" "mjpeg" \
             "$(probe -select_streams v -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$ENC")"
+
+# #given fixtures for the folder-art lookup. art_img's size is interpolated, so
+# every reference is braced: "$2:s=..." would parse as a zsh :s modifier.
+art_img() {
+  ffmpeg -nostdin -hide_banner -loglevel error -y \
+    -f lavfi -i "color=c=${2}:s=${3}x${3}:d=1" -frames:v 1 "$1"
+}
+tone_flac() {
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=1" -c:a flac "$1"
+}
+art_width() { probe -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 -- "$1" }
+art_codec() { probe -select_streams v -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$1" }
+
+print -r -- "folder art: preference order is explicit, not alphabetical luck"
+AU="$WORK/artunit"
+mkdir -p "$AU/pref" "$AU/ext" "$AU/case" "$AU/zero" "$AU/zeroonly" "$AU/empty"
+art_img "$AU/pref/front.png" red 32
+art_img "$AU/pref/folder.jpg" red 48
+art_img "$AU/pref/cover.jpg" red 64
+assert_eq   "cover wins over folder and front" "cover.jpg" \
+            "${$("$DECANT" --folder-art "$AU/pref"):t}"
+rm -f "$AU/pref/cover.jpg"
+assert_eq   "folder wins once cover is gone" "folder.jpg" \
+            "${$("$DECANT" --folder-art "$AU/pref"):t}"
+rm -f "$AU/pref/folder.jpg"
+assert_eq   "front is the last resort" "front.png" \
+            "${$("$DECANT" --folder-art "$AU/pref"):t}"
+art_img "$AU/ext/cover.png" red 32
+art_img "$AU/ext/cover.jpg" red 64
+assert_eq   "jpg beats png for the same name" "cover.jpg" \
+            "${$("$DECANT" --folder-art "$AU/ext"):t}"
+art_img "$AU/case/COVER.JPG" red 64
+assert_eq   "the lookup stays case-insensitive" "COVER.JPG" \
+            "${$("$DECANT" --folder-art "$AU/case"):t}"
+: > "$AU/zero/cover.jpg"
+art_img "$AU/zero/folder.jpg" red 48
+assert_eq   "a 0-byte cover.jpg never displaces a real folder.jpg" "folder.jpg" \
+            "${$("$DECANT" --folder-art "$AU/zero"):t}"
+: > "$AU/zeroonly/cover.jpg"
+assert_eq   "a 0-byte cover.jpg on its own yields no art" "" \
+            "$("$DECANT" --folder-art "$AU/zeroonly")"
+assert_eq   "a folder with no art yields nothing" "" \
+            "$("$DECANT" --folder-art "$AU/empty")"
+
+print -r -- "folder art: multi-disc walk-up, bounded and guarded"
+mkdir -p "$AU/Album/CD1" "$AU/Album/Disc 2" "$AU/Album/disk3" "$AU/Album/cd" "$AU/Album/Bonus Tracks"
+art_img "$AU/Album/cover.jpg" red 64
+assert_eq   "CD1 borrows the album root's cover" "$AU/Album/cover.jpg" \
+            "$("$DECANT" --folder-art "$AU/Album/CD1")"
+assert_eq   "'Disc 2' (separator + number) borrows it too" "$AU/Album/cover.jpg" \
+            "$("$DECANT" --folder-art "$AU/Album/Disc 2")"
+assert_eq   "'disk3' borrows it too" "$AU/Album/cover.jpg" \
+            "$("$DECANT" --folder-art "$AU/Album/disk3")"
+assert_eq   "a folder named 'cd' with no number does NOT walk up" "" \
+            "$("$DECANT" --folder-art "$AU/Album/cd")"
+assert_eq   "an ordinary subfolder does NOT walk up" "" \
+            "$("$DECANT" --folder-art "$AU/Album/Bonus Tracks")"
+art_img "$AU/Album/CD1/folder.jpg" blue 48
+assert_eq   "the disc's own art wins over the album root's" "$AU/Album/CD1/folder.jpg" \
+            "$("$DECANT" --folder-art "$AU/Album/CD1")"
+# #then the walk must stop after one level: a library root's stray cover.jpg is
+# never an album cover, however many disc folders sit below it.
+mkdir -p "$AU/Library/Some Album" "$AU/Library/Artless Album/CD1"
+art_img "$AU/Library/cover.jpg" green 64
+assert_eq   "a stray cover in a shared parent is NOT pulled into an album" "" \
+            "$("$DECANT" --folder-art "$AU/Library/Some Album")"
+assert_eq   "...and a disc folder cannot reach past its album to find it" "" \
+            "$("$DECANT" --folder-art "$AU/Library/Artless Album/CD1")"
+
+print -r -- "folder art: end-to-end embedding (fill-gaps-only)"
+FA="$WORK/folderart"
+mkdir -p "$FA/Multi/CD1" "$FA/Own/CD2" "$FA/Embedded/CD1" "$FA/Library/Some Album" \
+         "$FA/Ålbum ✧ (2026)/Disc 2" "$FA/Bogus/CD1"
+art_img "$FA/Multi/cover.jpg" red 64
+tone_flac "$FA/Multi/CD1/01 - Track.flac"
+art_img "$FA/Own/cover.jpg" red 64
+art_img "$FA/Own/CD2/cover.jpg" blue 48
+tone_flac "$FA/Own/CD2/01 - Track.flac"
+art_img "$FA/Embedded/cover.jpg" red 64
+art_img "$WORK/_ea.png" green 32
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=441:duration=1" -c:a flac "$WORK/_ea.flac"
+ffmpeg -nostdin -hide_banner -loglevel error -i "$WORK/_ea.flac" -i "$WORK/_ea.png" \
+  -map 0:a -map 1:v -c copy -disposition:v attached_pic "$FA/Embedded/CD1/01 - Track.flac"
+rm -f "$WORK/_ea.png" "$WORK/_ea.flac"
+art_img "$FA/Library/cover.jpg" green 64
+tone_flac "$FA/Library/Some Album/01 - Track.flac"
+art_img "$FA/Ålbum ✧ (2026)/cover.jpg" red 64
+tone_flac "$FA/Ålbum ✧ (2026)/Disc 2/01 - Trâck ✧.flac"
+print -r -- "definitely not a jpeg" > "$FA/Bogus/cover.jpg"
+tone_flac "$FA/Bogus/CD1/01 - Track.flac"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$FA" >/dev/null 2>&1
+assert_eq   "a multi-disc track embeds the album root's cover" "64" \
+            "$(art_width "$FA/Multi/CD1/01 - Track.aiff")"
+assert_eq   "art in the track's own folder wins over the parent's" "48" \
+            "$(art_width "$FA/Own/CD2/01 - Track.aiff")"
+assert_eq   "a track with its own embedded art keeps it untouched" "32" \
+            "$(art_width "$FA/Embedded/CD1/01 - Track.aiff")"
+assert_eq   "a stray cover above a normal album folder is never embedded" "" \
+            "$(art_codec "$FA/Library/Some Album/01 - Track.aiff")"
+assert_eq   "spaces and unicode in the path don't break the walk-up" "64" \
+            "$(art_width "$FA/Ålbum ✧ (2026)/Disc 2/01 - Trâck ✧.aiff")"
+assert_true "a cover.jpg that isn't an image still converts the audio" \
+            test -f "$FA/Bogus/CD1/01 - Track.aiff"
+assert_eq   "...as valid PCM" "pcm_s16be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$FA/Bogus/CD1/01 - Track.aiff")"
+assert_eq   "...with no bogus image stream attached" "" \
+            "$(art_codec "$FA/Bogus/CD1/01 - Track.aiff")"
+NF="$WORK/folderart-noenrich"
+mkdir -p "$NF/Multi/CD1"
+art_img "$NF/Multi/cover.jpg" red 64
+tone_flac "$NF/Multi/CD1/01 - Track.flac"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --no-enrich "$NF" >/dev/null 2>&1
+assert_eq   "--no-enrich embeds no folder art, parent or otherwise" "" \
+            "$(art_codec "$NF/Multi/CD1/01 - Track.aiff")"
 
 print -r -- "enrichment: --dry-run changes nothing"
 DR="$WORK/dryrun"; mkdir -p "$DR"
@@ -474,7 +711,7 @@ assert_eq   "--version short-circuits before any path is read" "0" "$?"
 assert_eq   "--version combined with --dry-run exits 0" "0" "$?"
 
 print -r -- "CLI contract: hidden diagnostics survive the option check"
-for HD in --detect-catalog --derive-track-disc --normalize-feat --mp3-bitrate; do
+for HD in --detect-catalog --derive-track-disc --normalize-feat --mp3-bitrate --folder-art --resample-args; do
   "$DECANT" "$HD" '' >/dev/null 2>&1
   assert_eq "$HD dispatches instead of being rejected as an option" "0" "$?"
 done

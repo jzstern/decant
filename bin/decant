@@ -56,6 +56,7 @@ Environment:
   DECANT_NO_ENRICH        Same as --no-enrich.
   DECANT_KEEP_ORIGINALS   Convert without trashing the originals.
   DECANT_NO_NOTIFY        Suppress the notification even with --notify.
+  DECANT_NO_SOXR          Resample with ffmpeg's default engine, not libsoxr.
   DECANT_LOG              Log file path (default ~/Library/Logs/decant.log).
 
 Exit status:
@@ -79,7 +80,7 @@ Examples:
 typeset -i HIDDEN_DISPATCH=0
 case "${1:-}" in
   --check-root|--detect-catalog|--derive-track-disc|--normalize-feat|--mp3-bitrate \
-    |--is-audio-ext|--classify-codec) HIDDEN_DISPATCH=1 ;;
+    |--is-audio-ext|--classify-codec|--folder-art|--resample-args) HIDDEN_DISPATCH=1 ;;
 esac
 
 typeset -a TARGETS
@@ -259,6 +260,45 @@ mp3_bitrate_for() {
   fi
 }
 
+# libsoxr resamples measurably more cleanly than swresample's built-in engine,
+# but it is an optional ffmpeg build dependency (Homebrew's bottle ships
+# without it). `ffmpeg -h filter=aresample` advertises `soxr` as an option
+# value even on builds that lack the library, so the only trustworthy test is
+# to actually run a hundredth of a second through it. Probed at most once per
+# run, and only when a file really needs resampling.
+typeset -i _soxr=-1
+has_soxr() {
+  if (( _soxr < 0 )); then
+    if [[ -n "${DECANT_NO_SOXR:-}" ]]; then
+      _soxr=0
+    elif ffmpeg -nostdin -hide_banner -v quiet -f lavfi -i "anullsrc=r=8000:cl=mono" \
+           -t 0.01 -af "aresample=resampler=soxr:precision=28" -ar 16000 \
+           -f null - >/dev/null 2>&1; then
+      _soxr=1
+    else
+      _soxr=0
+    fi
+  fi
+  (( _soxr ))
+}
+
+# Set RESAMPLE_ARGS to the ffmpeg options that move a source at SR onto a rate
+# CDJs can play (32/44.1/48 kHz, the MPEG-1 Layer III set), or leave it empty
+# when the source is already on one. Above 48 kHz goes to 48 kHz so the extra
+# bandwidth is halved rather than quartered; everything else goes to 44.1 kHz.
+cdj_resample_args() {
+  local sr="$1"
+  RESAMPLE_ARGS=()
+  case "$sr" in
+    32000|44100|48000) return 0 ;;
+  esac
+  local target=44100
+  [[ "$sr" == <-> ]] && (( sr > 48000 )) && target=48000
+  RESAMPLE_ARGS=(-ar "$target")
+  has_soxr && RESAMPLE_ARGS+=(-af "aresample=resampler=soxr:precision=28")
+  return 0
+}
+
 # ── Metadata enrichment ─────────────────────────────────────────────────────
 # Derive tags that live in folder/file names but are missing from the audio
 # tags, and normalise feat.→ft. All derivation is fill-gaps-only (set by
@@ -326,13 +366,49 @@ derive_track_disc() {
   (( ${#out} )) && print -r -- "${out}"
 }
 
-# Echo the path to album-folder cover art (cover/folder/front .jpg/.jpeg/.png),
-# or nothing.
-find_folder_art() {
-  local dir="$1" f
-  for f in "$dir"/(#i)(cover|folder|front).(jpg|jpeg|png)(N); do
-    [[ -f "$f" ]] && { print -r -- "$f"; return; }
+# Art names and extensions in explicit preference order. A single glob returns
+# matches alphabetically, which would make the winner an accident of naming and
+# would silently reshuffle the moment another name is added here.
+_art_names=(cover folder front)
+_art_exts=(jpg jpeg png)
+
+# Echo the preferred art file sitting directly in DIR, or nothing. Zero-byte
+# files are ignored so a placeholder can never displace a real cover.
+_art_in_dir() {
+  local dir="$1" name ext f
+  local -a found
+  found=("$dir"/(#i)(cover|folder|front).(jpg|jpeg|png)(N-.))
+  for name in $_art_names; do
+    for ext in $_art_exts; do
+      for f in $found; do
+        [[ "${${f:t}:l}" == "$name.$ext" && -s "$f" ]] && { print -r -- "$f"; return 0 }
+      done
+    done
   done
+  return 1
+}
+
+# True for a folder that names itself as one disc of a set: CD1, CD 2, Disc-03…
+_is_disc_folder() {
+  [[ "${1:l}" == (cd|disc|disk)[[:space:]._-]#<0-999> ]]
+}
+
+# Echo the path to cover art for a track living in DIR, or nothing.
+#
+# Multi-disc releases keep the artwork at the album root (Album/cover.jpg) and
+# the tracks one level down (Album/CD1/…), so a disc folder falls back to its
+# parent. ONLY a disc folder does, and only one level: any other directory's
+# parent is just as likely to be a shared library root like ~/Music, whose
+# stray cover.jpg belongs to nothing in particular — embedding it would stamp
+# an unrelated image onto every album underneath.
+find_folder_art() {
+  local dir="$1"
+  local up="${dir:h}"
+  _art_in_dir "$dir" && return 0
+  _is_disc_folder "${dir:t}" || return 1
+  [[ "$up" != "$dir" ]] || return 1
+  is_forbidden_root "$up" && return 1
+  _art_in_dir "$up"
 }
 
 # Build META_ARGS (ffmpeg -metadata args), META_PLAN (human-readable summary)
@@ -536,17 +612,12 @@ process_file() {
     # -compression_level 0 = LAME's best-quality (slowest) algorithm at the
     # chosen CBR rate.
     ENC_EXTRA=(-b:a "${kbps}k" -compression_level 0)
-    # CDJs only play MPEG-1 Layer III rates (32/44.1/48 kHz); off-spec source
-    # rates resample to 44.1 kHz (48 kHz when the source is above 48 kHz).
+    # CDJs only play MPEG-1 Layer III rates, so an off-spec source rate has to
+    # be resampled. Empty for a source already on a supported rate — the AIFF
+    # path never resamples at all.
     local sr; sr=$(print -r -- "$info" | awk -F= '$1=="sample_rate"{print $2; exit}')
-    case "$sr" in
-      32000|44100|48000) ;;
-      *) if [[ "$sr" == <-> ]] && (( sr > 48000 )); then
-           ENC_EXTRA+=(-ar 48000)
-         else
-           ENC_EXTRA+=(-ar 44100)
-         fi ;;
-    esac
+    cdj_resample_args "$sr"
+    ENC_EXTRA+=("${RESAMPLE_ARGS[@]}")
     label="mp3 ${kbps}k"
   fi
 
@@ -655,6 +726,8 @@ fi
 # what gets converted can be unit-tested without an ffmpeg run (mirrors
 # --check-root). ffmpeg decodes but cannot encode Shorten or DSD, so there is no
 # way to generate a fixture for them — this is the only way to test their class.
+# --resample-args is the exception that still shells out to ffmpeg, and that is
+# the point: it reports what this build would genuinely be told to resample with.
 case "${1:-}" in
   --detect-catalog)    detect_catalog "${2:-}"; exit 0 ;;
   --derive-track-disc) derive_track_disc "${2:-}"; exit 0 ;;
@@ -667,6 +740,8 @@ case "${1:-}" in
     else                            print -r -- lossy
     fi
     exit 0 ;;
+  --folder-art)        find_folder_art "${2:-}"; exit 0 ;;
+  --resample-args)     cdj_resample_args "${2:-}"; print -r -- "${RESAMPLE_ARGS[*]}"; exit 0 ;;
 esac
 
 ensure_tools

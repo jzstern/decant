@@ -170,6 +170,14 @@ The output is deliberately the most **CDJ/rekordbox-compatible** MP3 possible:
   (e.g. 22.05 kHz) is resampled to 44.1 kHz (48 kHz for sources above 48 kHz);
   standard-rate sources are never resampled
 
+When a resample is unavoidable, `decant` uses **libsoxr at precision 28** —
+measurably cleaner than ffmpeg's built-in resampler. libsoxr is an optional
+ffmpeg build dependency (Homebrew's bottle currently ships without it, so
+`ffmpeg -buildconf | grep libsoxr` is worth a look), so support is verified at
+run time by actually pushing a few milliseconds of audio through it; builds
+without it fall back to the default resampler rather than failing the
+conversion. `DECANT_NO_SOXR=1` forces the fallback.
+
 ## Metadata enrichment
 
 During conversion, `decant` derives tags that live in the file/folder names but
@@ -183,7 +191,7 @@ a pure transcode.
 | **Catalog number** | album folder name, e.g. `[SHA300]`, `(snf137)`, `{LLR004}`, bare `USB002` | `grouping` (uppercased, e.g. `SHA300`) | only if no `grouping` tag |
 | **Track / disc** | leading filename token: `01 - …`, `001 - …`, `(01 - 02) …` | `track` / `disc` | leading number only (trailing numbers in a title ignored); only if absent |
 | **`feat.`→`ft.`** | the `title` itself | `title` | word-anchored (`FEISTY` is safe); the one value that is *edited*, not gap-filled |
-| **Folder artwork** | `cover`/`folder`/`front`.`jpg`/`png` beside the file | embedded cover | only if the source has no embedded art |
+| **Folder artwork** | `cover`, then `folder`, then `front` — `.jpg`, then `.jpeg`, then `.png` — beside the file, or in the album root for a track in a disc subfolder | embedded cover | only if the source has no embedded art |
 
 Catalog detection rejects look-alikes in the same brackets — format/quality
 words (`[WEB FLAC]`, `[FLAC 24]`), years (`(2026)`), release types (`[EP]`), and
@@ -191,6 +199,26 @@ barcodes (`{…, 5056818805226}`). The heuristics are tuned to scene/label folde
 naming; on a 7,988-folder test library it found ~5,500 real catalog numbers with
 a single false positive. If your library is named differently and you don't want
 the guesswork, run with `--no-enrich`.
+
+Artwork lookup is case-insensitive and skips zero-byte files. The name and
+extension order in the table is the tie-break when a folder holds several
+candidates, so the same album always yields the same cover.
+
+Multi-disc releases keep the art at the album root and the tracks one level
+down, so a track in a **disc subfolder** — a folder named `CD1`, `CD 2`,
+`Disc-03`, `disk4` and nothing else — falls back to its parent's cover:
+
+```
+Album/cover.jpg              ← embedded into both tracks below
+Album/CD1/01 - Track.flac
+Album/CD2/01 - Track.flac
+```
+
+That fallback goes exactly one level, and only from a disc folder. A track in
+an ordinary folder never reaches up: the parent of `~/Music/Some Album` is
+`~/Music`, and a stray `cover.jpg` sitting there belongs to nothing in
+particular — embedding it would stamp one unrelated image onto every album in
+the library.
 
 Preview exactly what each file would get, without writing anything:
 
@@ -247,6 +275,7 @@ temporarily — change `exec decant --notify "$@"` to
 | `--` | — | End of options: every remaining argument is a path. |
 | — | `DECANT_KEEP_ORIGINALS` | Convert without trashing originals (cautious first pass). |
 | — | `DECANT_NO_NOTIFY` | Suppress the completion notification even with `--notify`. |
+| — | `DECANT_NO_SOXR` | Resample with ffmpeg's default engine instead of libsoxr. |
 | — | `DECANT_LOG` | Override the log file path (used by the test suite). |
 
 ### Exit codes
