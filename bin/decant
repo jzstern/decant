@@ -67,6 +67,7 @@ Exit status:
   66  a given path does not exist
   69  ffmpeg/ffprobe are unavailable and were not installed
   77  refused a path that is too broad to recurse (a filesystem or home root)
+  130 interrupted by a signal — 128 + its number, so 143 for TERM, 129 for HUP
 
 Examples:
   decant ~/Music/Album              # recurse a folder
@@ -508,18 +509,45 @@ build_meta_args() {
   fi
 }
 
+# Echo a free path inside DIR for NAME, uniquified Finder-style ("Intro.flac",
+# then "Intro 2.flac", "Intro 3.flac", …). The Trash is one flat namespace, so
+# two albums with the same track name would otherwise collide.
+trash_fallback_dest() {
+  local dir="$1" base="${2:t}"
+  local stem="${base:r}" ext="${base:e}" n=2 candidate
+  [[ -n "$ext" ]] && ext=".$ext"
+  # A name that is nothing but an extension (".flac") has no stem to number.
+  [[ -z "$stem" ]] && { stem="$base"; ext="" }
+  candidate="$dir/$base"
+  while [[ -e "$candidate" ]]; do
+    candidate="$dir/$stem $n$ext"
+    (( n++ ))
+  done
+  print -r -- "$candidate"
+}
+
+# Returns non-zero when the original could NOT be trashed, so the caller can say
+# so instead of implying the file is gone.
 trash_original() {
   [[ -n "${DECANT_KEEP_ORIGINALS:-}" ]] && return 0
   local abs="${1:A}"
   # Use NSFileManager (not Apple Events to Finder): moves to Trash with Put Back
   # support and, crucially, never triggers the "control Finder" automation prompt
   # that would otherwise stall a Finder Quick Action on first use.
-  /usr/bin/osascript -l JavaScript \
-    -e 'ObjC.import("Foundation");' \
-    -e 'function run(argv){var fm=$.NSFileManager.defaultManager;var u=$.NSURL.fileURLWithPath(argv[0]);return fm.trashItemAtURLResultingItemURLError(u,null,null)?"":"fail";}' \
-    "$abs" >/dev/null 2>&1 && return 0
-  # Fallback: move into ~/.Trash directly.
-  mv -f -- "$abs" "$HOME/.Trash/" 2>/dev/null
+  # (DECANT_FORCE_TRASH_FALLBACK skips it so the tests can reach the fallback.)
+  if [[ -z "${DECANT_FORCE_TRASH_FALLBACK:-}" ]]; then
+    /usr/bin/osascript -l JavaScript \
+      -e 'ObjC.import("Foundation");' \
+      -e 'function run(argv){var fm=$.NSFileManager.defaultManager;var u=$.NSURL.fileURLWithPath(argv[0]);return fm.trashItemAtURLResultingItemURLError(u,null,null)?"":"fail";}' \
+      "$abs" >/dev/null 2>&1 && return 0
+  fi
+  # Fallback: move into ~/.Trash directly. Also the path taken for files on an
+  # external volume, where this becomes a cross-device copy into the home Trash.
+  # Unlike NSFileManager this does not uniquify on its own, so pick a free name
+  # rather than letting mv silently overwrite an earlier trashed file.
+  local trash="${DECANT_TRASH_DIR:-$HOME/.Trash}"
+  [[ -d "$trash" ]] || return 1
+  mv -- "$abs" "$(trash_fallback_dest "$trash" "$abs")" 2>/dev/null
 }
 
 # A produced file counts as valid only if ffprobe can read an audio stream
@@ -541,6 +569,30 @@ discard_output() {
     -e 'function run(a){var fm=$.NSFileManager.defaultManager;var u=$.NSURL.fileURLWithPath(a[0]);fm.trashItemAtURLResultingItemURLError(u,null,null);return "";}' \
     "${f:A}" >/dev/null 2>&1
 }
+
+# ffmpeg writes straight to the final destination (see the note in process_file),
+# so a run killed mid-encode leaves an unplayable stub sitting at the output
+# path. Hold the in-flight destination somewhere the handler can see it; empty
+# means nothing is being written and there is nothing to clean up.
+IN_FLIGHT_DEST=""
+
+# zsh defers a trap until the foreground child returns, so this runs once the
+# signalled ffmpeg is gone — after which the half-written file is safe to drop.
+on_signal() {
+  local name="$1" num="$2"
+  if [[ -n "$IN_FLIGHT_DEST" ]]; then
+    discard_output "$IN_FLIGHT_DEST"
+    log_line "INTERRUPTED ($name) discarded partial output $IN_FLIGHT_DEST"
+    print -u2 "decant: interrupted ($name) — discarded the partial ${IN_FLIGHT_DEST:t}"
+    IN_FLIGHT_DEST=""
+  else
+    print -u2 "decant: interrupted ($name)"
+  fi
+  exit $(( 128 + num ))
+}
+trap 'on_signal INT 2'   INT
+trap 'on_signal TERM 15' TERM
+trap 'on_signal HUP 1'   HUP
 
 # Sets CONVERT_ERR on total failure and ART_DROPPED when the art-preserving
 # attempt fails but the audio-only fallback succeeds. Writes straight to "$out".
@@ -661,9 +713,21 @@ process_file() {
 
   local dest="${src:r}.$out_fmt"
   if [[ -e "$dest" && "${dest:A}" != "${src:A}" ]]; then
-    print -u2 "decant: skip ${src:t} — ${dest:t} already exists"
-    log_debug "SKIP (target exists) $src"
-    (( skipped++ )); return
+    if [[ -d "$dest" ]]; then
+      # Never treat a directory as debris — discarding it would trash the folder
+      # and everything in it.
+      print -u2 "decant: FAILED ${src:t} — ${dest:t} exists and is a directory"
+      log_line "FAILED $src :: target exists as a directory: $dest"
+      (( failed++ )); return
+    elif [[ -s "$dest" ]] && valid_audio "$dest"; then
+      print -u2 "decant: skip ${src:t} — ${dest:t} already exists"
+      log_debug "SKIP (target exists) $src"
+      (( skipped++ )); return
+    fi
+    # Empty or unreadable: debris from a run that died mid-encode. Skipping it
+    # would strand this source forever, silently and without explanation.
+    print -u2 "decant: ${dest:t} exists but is not valid audio — treating it as debris from an interrupted run"
+    log_line "RECOVER (unusable target) $src -> $dest"
   fi
 
   local tgt label
@@ -724,9 +788,17 @@ process_file() {
   # rename/delete a file a child process (ffmpeg) created — which is why the
   # old "ffmpeg → temp, shell mv → dest" approach failed in Downloads/Desktop/
   # Documents. The original is trashed only after the output is verified valid.
+  IN_FLIGHT_DEST="$dest"
   if convert_file "$src" "$tgt" "$dest" "$out_fmt" && [[ -s "$dest" ]] && valid_audio "$dest"; then
-    trash_original "$src"
+    IN_FLIGHT_DEST=""
+    local trashed=1
+    trash_original "$src" || trashed=0
     print -u2 -- "decant: converted ${src:t} → ${dest:t} ($label)"
+    if (( ! trashed )); then
+      # The conversion still succeeded; the user just has both files now.
+      print -u2 "decant: warning: could not move ${src:t} to the Trash — the original is still there"
+      log_line "TRASH FAILED $src (original left in place)"
+    fi
     if (( ART_DROPPED )); then
       print -u2 "decant: note: dropped unembeddable artwork for ${src:t}"
       log_debug "CONVERTED (artwork dropped) $src -> $dest [$label]"
@@ -736,6 +808,7 @@ process_file() {
     (( converted++ ))
   else
     discard_output "$dest"
+    IN_FLIGHT_DEST=""
     print -u2 "decant: FAILED ${src:t}"
     log_line "FAILED $src [$tgt] :: ${CONVERT_ERR:-unknown error}"
     (( failed++ ))
