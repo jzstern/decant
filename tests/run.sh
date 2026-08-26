@@ -53,6 +53,17 @@ ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=300:dur
   -metadata title="Wav Meta" -metadata artist="toaiff" "$WORK/tagged24.wav"
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=330:duration=1" -c:a libmp3lame -q:a 4 "$WORK/song.mp3"
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=550:duration=1" -c:a pcm_s16be "$WORK/already.aiff"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=600:duration=2" -c:a aac -b:a 160k \
+  -metadata title="Aac Meta" -metadata artist="toaiff" "$WORK/pop.m4a"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=610:duration=1" -c:a alac "$WORK/alactrack.m4a"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=620:duration=2" -c:a libopus -b:a 96k \
+  -metadata title="Opus Meta" "$WORK/voice.opus"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=630:duration=2" -ar 22050 -c:a aac -b:a 48k \
+  "$WORK/lofi.m4a"
+# Same audio packets as voice.opus but with a huge tag — the container-average
+# bitrate is inflated, the audio-only measurement must not be.
+ffmpeg -nostdin -hide_banner -loglevel error -i "$WORK/voice.opus" -map 0:a -c copy \
+  -metadata title="${(l:131072::x:)}" "$WORK/padded.opus"
 print -r -- "not audio" > "$WORK/readme.txt"
 : > "$WORK/corrupt.flac"   # 0-byte file with a lossless extension
 # A text file whose extension (.al) ffmpeg would otherwise mis-detect as raw
@@ -101,6 +112,52 @@ assert_true "a non-audio .al file is ignored by the extension gate (no AIFF)" \
             test ! -f "$WORK/notes.aiff"
 assert_eq   "the run exits 0 even with a corrupt file present" \
             "0" "$run_rc"
+
+print -r -- "lossy m4a/opus → MP3 (bitrate-capped, metadata preserved)"
+assert_eq   "AAC .m4a converts to an MP3" \
+            "mp3" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$WORK/pop.mp3")"
+assert_eq   "carries the m4a title tag into the MP3" \
+            "Aac Meta" \
+            "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$WORK/pop.mp3")"
+assert_eq   "carries the m4a artist tag into the MP3" \
+            "toaiff" \
+            "$(probe -show_entries format_tags=artist -of default=nw=1:nk=1 -- "$WORK/pop.mp3")"
+M4A_BR="$(probe -select_streams a:0 -show_entries stream=bit_rate -of default=nw=1:nk=1 -- "$WORK/pop.m4a")"
+MP3_BR="$(probe -select_streams a:0 -show_entries stream=bit_rate -of default=nw=1:nk=1 -- "$WORK/pop.mp3")"
+assert_true "MP3 bitrate does not exceed the m4a source (no upscaling)" \
+            test "${MP3_BR:-999999999}" -le "${M4A_BR:-0}"
+assert_eq   ".opus converts to an MP3" \
+            "mp3" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$WORK/voice.mp3")"
+assert_eq   "carries the opus title tag into the MP3" \
+            "Opus Meta" \
+            "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$WORK/voice.mp3")"
+OPUS_BR="$(probe -show_entries format=bit_rate -of default=nw=1:nk=1 -- "$WORK/voice.opus")"
+OMP3_BR="$(probe -select_streams a:0 -show_entries stream=bit_rate -of default=nw=1:nk=1 -- "$WORK/voice.mp3")"
+assert_true "MP3 bitrate does not exceed the opus source (no upscaling)" \
+            test "${OMP3_BR:-999999999}" -le "${OPUS_BR:-0}"
+assert_eq   "tag-padded opus gets the same cap as its identical-audio twin" \
+            "$OMP3_BR" \
+            "$(probe -select_streams a:0 -show_entries stream=bit_rate -of default=nw=1:nk=1 -- "$WORK/padded.mp3")"
+assert_true "ALAC .m4a still becomes AIFF (lossless path unchanged)" \
+            test -f "$WORK/alactrack.aiff"
+assert_true "ALAC .m4a does not get an MP3" \
+            test ! -f "$WORK/alactrack.mp3"
+
+print -r -- "CDJ compatibility (sample rates in the 32/44.1/48kHz set)"
+assert_eq   "48kHz opus keeps its native rate (48k is CDJ-supported)" "48000" \
+            "$(probe -select_streams a:0 -show_entries stream=sample_rate -of default=nw=1:nk=1 -- "$WORK/voice.mp3")"
+assert_eq   "22.05kHz m4a is resampled to 44.1kHz for CDJ playback" "44100" \
+            "$(probe -select_streams a:0 -show_entries stream=sample_rate -of default=nw=1:nk=1 -- "$WORK/lofi.mp3")"
+
+print -r -- "mp3 bitrate cap (highest standard rate ≤ source, 320 max)"
+assert_eq   "unknown source bitrate -> 320" "320" "$("$TOAIFF" --mp3-bitrate '')"
+assert_eq   "1411kbps (CD) -> capped at 320" "320" "$("$TOAIFF" --mp3-bitrate 1411000)"
+assert_eq   "exactly 256k -> 256" "256" "$("$TOAIFF" --mp3-bitrate 256000)"
+assert_eq   "129k -> 128 (rounded down, never up)" "128" "$("$TOAIFF" --mp3-bitrate 129000)"
+assert_eq   "127k -> 112 (next standard rate below)" "112" "$("$TOAIFF" --mp3-bitrate 127000)"
+assert_eq   "8k -> floor of 32" "32" "$("$TOAIFF" --mp3-bitrate 8000)"
 
 print -r -- "originals + logging"
 assert_true "originals are preserved when TOAIFF_KEEP_ORIGINALS is set" \
@@ -190,9 +247,13 @@ ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "color=c=blue:s=48x48:d
 # A sibling that already has track=7 — fill-gaps-only must not overwrite it.
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=330:duration=1" \
   -c:a flac -metadata track=7 -metadata title="Preset" "$EN/05 - Preset.flac"
+# A lossy sibling — enrichment must apply on the MP3 path too.
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=520:duration=2" \
+  -c:a aac -b:a 128k -metadata title="Lion Dub" "$EN/03 - Lion Dub.m4a"
 TOAIFF_KEEP_ORIGINALS=1 TOAIFF_LOG="$LOG" "$TOAIFF" "$EN" >/dev/null 2>&1
 ENA="$EN/02 - Lion Soul (feat. Someone).aiff"
 ENB="$EN/05 - Preset.aiff"
+ENC="$EN/03 - Lion Dub.mp3"
 assert_eq   "catalog -> grouping (uppercased)" "ARTKL081" \
             "$(probe -show_entries format_tags=grouping -of default=nw=1:nk=1 -- "$ENA")"
 assert_eq   "track backfilled from filename" "2" \
@@ -205,6 +266,12 @@ assert_eq   "audio depth still preserved alongside enrichment" "pcm_s24be" \
             "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$ENA")"
 assert_eq   "existing track tag is NOT overwritten (fill-gaps-only)" "7" \
             "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$ENB")"
+assert_eq   "catalog grouping written to the MP3 too" "ARTKL081" \
+            "$(probe -show_entries format_tags=grouping -of default=nw=1:nk=1 -- "$ENC")"
+assert_eq   "track backfilled into the MP3 too" "3" \
+            "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$ENC")"
+assert_eq   "folder art embedded into the MP3 as JPEG (CDJs ignore PNG APIC)" "mjpeg" \
+            "$(probe -select_streams v -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$ENC")"
 
 print -r -- "enrichment: --dry-run changes nothing"
 DR="$WORK/dryrun"; mkdir -p "$DR"
