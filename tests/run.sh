@@ -345,6 +345,166 @@ head -c 4096 /dev/urandom | DECANT_LOG="$LOG" "$DECANT" >/dev/null 2>&1
 assert_eq   "no arguments + binary stdin exits with usage code 64, no scan" \
             "64" "$?"
 
+print -r -- "CLI contract: --help / -h"
+HELP_OUT="$("$DECANT" --help)"
+assert_eq   "--help exits 0" "0" "$?"
+"$DECANT" -h >/dev/null 2>&1
+assert_eq   "-h exits 0" "0" "$?"
+assert_eq   "-h prints exactly the same usage as --help" \
+            "$HELP_OUT" "$("$DECANT" -h)"
+assert_eq   "usage goes to stdout, leaving stderr clean" "" \
+            "$("$DECANT" --help 2>&1 >/dev/null)"
+for FLAG in --notify --debug --dry-run --no-enrich --version '-h, --help'; do
+  assert_true "--help documents $FLAG" grep -qF -- "$FLAG" <<< "$HELP_OUT"
+done
+assert_true "--help documents the -- end-of-options marker" \
+            grep -qE '^  --  +Treat' <<< "$HELP_OUT"
+assert_true "--help documents the environment variables" \
+            grep -qF -- "DECANT_KEEP_ORIGINALS" <<< "$HELP_OUT"
+assert_true "--help documents the exit-status contract" \
+            grep -qF -- "Exit status:" <<< "$HELP_OUT"
+assert_true "--help shows worked examples" \
+            grep -qF -- "decant --dry-run ~/Music/Album" <<< "$HELP_OUT"
+
+print -r -- "CLI contract: exit codes"
+EX="$WORK/exitcodes"; mkdir -p "$EX"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=480:duration=1" -c:a flac "$EX/clean.flac"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=481:duration=1" -c:a flac "$EX/mixed.flac"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$EX/clean.flac" >/dev/null 2>&1
+assert_eq   "a clean conversion exits 0" "0" "$?"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$WORK/song.mp3" >/dev/null 2>&1
+assert_eq   "a run that only skips exits 0 (skipping is not an error)" "0" "$?"
+DECANT_LOG="$LOG" "$DECANT" --dry-run "$EX" >/dev/null 2>&1
+assert_eq   "a clean --dry-run exits 0" "0" "$?"
+"$DECANT" --version >/dev/null 2>&1
+assert_eq   "--version exits 0" "0" "$?"
+DECANT_LOG="$LOG" "$DECANT" "$WORK/no-such-file.flac" >/dev/null 2>&1
+assert_eq   "a path that does not exist exits 66" "66" "$?"
+DECANT_LOG="$LOG" "$DECANT" --dry-run "$WORK/no-such-file.flac" >/dev/null 2>&1
+assert_eq   "--dry-run over a missing path still exits 66" "66" "$?"
+DECANT_LOG="$LOG" "$DECANT" "/" >/dev/null 2>&1
+assert_eq   "a refused forbidden root exits 77" "77" "$?"
+DECANT_LOG="$LOG" "$DECANT" >/dev/null 2>&1 </dev/null
+assert_eq   "no arguments exits 64" "64" "$?"
+DECANT_LOG="$LOG" "$DECANT" --dry-run >/dev/null 2>&1 </dev/null
+assert_eq   "a flag with no path exits 64" "64" "$?"
+DECANT_LOG="$LOG" "$DECANT" --notifyy "$EX" >/dev/null 2>&1
+assert_eq   "an unknown option exits 64" "64" "$?"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$EX/mixed.flac" "$WORK/no-such-file.flac" >/dev/null 2>&1
+assert_eq   "a good conversion beside a missing path still exits 66" "66" "$?"
+assert_true "...and the good file was converted anyway" \
+            test -f "$EX/mixed.aiff"
+DECANT_LOG="$LOG" "$DECANT" "$WORK/song.mp3" "$WORK/no-such-file.flac" >/dev/null 2>&1
+assert_eq   "skips do not mask a missing path" "66" "$?"
+DECANT_LOG="$LOG" "$DECANT" "$WORK/no-such-file.flac" "/" >/dev/null 2>&1
+assert_eq   "a refusal outranks a missing path" "77" "$?"
+# A read-only folder is the cheapest real conversion failure: ffmpeg cannot
+# create the output, so nothing is trashed and the run has to say so.
+RO="$WORK/readonly"; mkdir -p "$RO"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=482:duration=1" -c:a flac "$RO/t.flac"
+chmod a-w "$RO"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$RO/t.flac" >/dev/null 2>&1
+assert_eq   "a conversion failure exits 1" "1" "$?"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$RO/t.flac" "$WORK/no-such-file.flac" >/dev/null 2>&1
+assert_eq   "a conversion failure outranks a missing path" "1" "$?"
+assert_true "the original survives a failed conversion" \
+            test -f "$RO/t.flac"
+chmod u+w "$RO"
+
+print -r -- "CLI contract: unknown options are rejected, never treated as paths"
+UNK_ERR="$(DECANT_LOG="$LOG" "$DECANT" --notifyy "$WORK" 2>&1 >/dev/null)"
+assert_true "the error names the offending option" \
+            grep -qF -- "unknown option: --notifyy" <<< "$UNK_ERR"
+assert_true "the error points at --help" \
+            grep -qF -- "--help" <<< "$UNK_ERR"
+assert_true "a typo is never reported as a missing path" \
+            test -z "$(grep 'not found' <<< "$UNK_ERR")"
+"$DECANT" -x "$WORK" >/dev/null 2>&1
+assert_eq   "a mistyped short option exits 64" "64" "$?"
+"$DECANT" --dry-runn "$WORK" >/dev/null 2>&1
+assert_eq   "a near-miss of a real flag exits 64" "64" "$?"
+"$DECANT" "$WORK" --notifyy >/dev/null 2>&1
+assert_eq   "an unknown option after a path is still rejected" "64" "$?"
+UO="$WORK/unknownopt"; mkdir -p "$UO"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=483:duration=1" -c:a flac "$UO/01 - Tone.flac"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --notifyy "$UO" >/dev/null 2>&1
+assert_true "a rejected run converts nothing at all" \
+            test ! -f "$UO/01 - Tone.aiff"
+
+print -r -- "CLI contract: -- ends option parsing"
+DASH="$WORK/dashnames"; mkdir -p "$DASH"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=484:duration=1" -c:a flac "$DASH/-foo.flac"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=485:duration=1" -c:a flac "$DASH/-bar.flac"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=486:duration=1" -c:a flac "$DASH/--notify.flac"
+# Only a *relative* name exercises this — an absolute path never starts with a dash.
+( cd "$DASH" && DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" -- -foo.flac >/dev/null 2>&1 )
+assert_eq   "a file named -foo.flac converts when passed after --" "0" "$?"
+assert_true "...and its .aiff lands beside it" \
+            test -f "$DASH/-foo.aiff"
+( cd "$DASH" && DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" -- --notify.flac >/dev/null 2>&1 )
+assert_true "a filename beginning with -- is a path after --, not a flag" \
+            test -f "$DASH/--notify.aiff"
+( cd "$DASH" && DECANT_LOG="$LOG" "$DECANT" -foo.flac >/dev/null 2>&1 )
+assert_eq   "the same name without -- is rejected as an option" "64" "$?"
+"$DECANT" -- >/dev/null 2>&1 </dev/null
+assert_eq   "-- with nothing after it is a usage error" "64" "$?"
+DASH_DRY="$( cd "$DASH" && DECANT_LOG="$LOG" "$DECANT" --dry-run -- -bar.flac 2>&1 )"
+assert_true "options before -- are still honoured" \
+            grep -q "would convert" <<< "$DASH_DRY"
+assert_true "...and that --dry-run wrote nothing" \
+            test ! -f "$DASH/-bar.aiff"
+
+print -r -- "CLI contract: option placement, repeats, and --version"
+FA="$WORK/flagorder"; mkdir -p "$FA"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=487:duration=1" -c:a flac "$FA/01 - Tone.flac"
+FA_OUT="$(DECANT_LOG="$LOG" "$DECANT" "$FA" --dry-run 2>&1)"
+assert_true "a flag placed after the path still takes effect" \
+            test ! -f "$FA/01 - Tone.aiff"
+assert_true "...and the dry-run plan is still printed" \
+            grep -q "would convert" <<< "$FA_OUT"
+DECANT_LOG="$LOG" "$DECANT" --dry-run --dry-run "$FA" >/dev/null 2>&1
+assert_eq   "a repeated flag is harmless" "0" "$?"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --no-enrich --no-enrich --debug "$FA" >/dev/null 2>&1
+assert_eq   "repeated and combined flags all parse" "0" "$?"
+assert_true "--version still prints the version when it follows another flag" \
+            grep -qE '^decant [0-9]+\.[0-9]+\.[0-9]+$' <<< "$("$DECANT" --debug --version)"
+"$DECANT" --version "$WORK/no-such-file.flac" >/dev/null 2>&1
+assert_eq   "--version short-circuits before any path is read" "0" "$?"
+"$DECANT" --dry-run --version >/dev/null 2>&1
+assert_eq   "--version combined with --dry-run exits 0" "0" "$?"
+
+print -r -- "CLI contract: hidden diagnostics survive the option check"
+for HD in --detect-catalog --derive-track-disc --normalize-feat --mp3-bitrate; do
+  "$DECANT" "$HD" '' >/dev/null 2>&1
+  assert_eq "$HD dispatches instead of being rejected as an option" "0" "$?"
+done
+"$DECANT" --check-root "$WORK/sub" >/dev/null 2>&1
+assert_eq   "--check-root dispatches instead of being rejected as an option" "2" "$?"
+
+print -r -- "mp3 bitrate: only digits reach zsh arithmetic"
+assert_eq   "letters are not a bitrate (unmeasurable -> 320)" "320" \
+            "$("$DECANT" --mp3-bitrate abc)"
+assert_eq   "a negative number is not a bitrate" "320" \
+            "$("$DECANT" --mp3-bitrate -5)"
+assert_eq   "a decimal is not a bitrate" "320" \
+            "$("$DECANT" --mp3-bitrate 12.5)"
+assert_eq   "digits with a trailing unit are not a bitrate" "320" \
+            "$("$DECANT" --mp3-bitrate 256000k)"
+assert_eq   "a space-padded number is not a bitrate" "320" \
+            "$("$DECANT" --mp3-bitrate ' 256000 ')"
+# zsh reads a bare word in arithmetic as a variable name and keeps expanding it,
+# so a value that happens to name a variable must never reach the comparison.
+assert_eq   "'converted' names a counter in the script but is not a bitrate" "320" \
+            "$("$DECANT" --mp3-bitrate converted)"
+assert_eq   "'skipped' names a counter in the script but is not a bitrate" "320" \
+            "$("$DECANT" --mp3-bitrate skipped)"
+assert_eq   "'PATH' expands to a string but is not a bitrate" "320" \
+            "$("$DECANT" --mp3-bitrate PATH)"
+assert_eq   "no arithmetic error leaks out on a variable-shaped input" "" \
+            "$("$DECANT" --mp3-bitrate PATH 2>&1 >/dev/null)"
+assert_eq   "real digits still cap normally after the guard" "192" \
+            "$("$DECANT" --mp3-bitrate 200000)"
+
 rm -rf "$WORK"
 
 print -r -- ""
