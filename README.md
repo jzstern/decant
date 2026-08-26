@@ -29,7 +29,9 @@ never overwrites a tag the source already has; the one exception is normalizing
 ## Requirements
 
 - macOS 13 (Ventura) or later — tested on Sequoia and Tahoe
-- [ffmpeg](https://ffmpeg.org) (installed automatically by Homebrew, below)
+- [ffmpeg](https://ffmpeg.org) — the Homebrew install below pulls it in for you;
+  otherwise `decant` offers to install it on first run (see
+  [Installing ffmpeg](#installing-ffmpeg))
 
 `decant` uses the first `ffmpeg`/`ffprobe` on your `PATH`, so a build you chose
 deliberately (a static build with extra encoders, MacPorts, Nix) is the one that
@@ -55,9 +57,22 @@ git clone https://github.com/jzstern/decant.git
 cd decant && ./install.sh
 ```
 
-Copies the CLI to `~/.local/bin/decant`. ffmpeg is installed via Homebrew on
-first run if it isn't already present.
+Copies the CLI to `~/.local/bin/decant`. ffmpeg is not installed for you — see
+[Installing ffmpeg](#installing-ffmpeg).
 </details>
+
+### Installing ffmpeg
+
+`brew install jzstern/tap/decant` lists ffmpeg as a dependency, so a Homebrew
+install already has it. Otherwise, on the first run that needs it:
+
+- **In a terminal**, `decant` asks before installing — `brew install ffmpeg` is
+  several hundred megabytes, so it never happens silently.
+- **Anywhere without a terminal** (the Finder Quick Action, `cron`, CI), it does
+  not install: there is nobody to ask and nowhere to show progress, so the run
+  exits `69` and tells you to run `brew install ffmpeg` yourself. Under
+  `--notify` that message arrives as a notification, since the Quick Action has
+  no visible output.
 
 ### Add the Finder right-click action (one time)
 
@@ -95,6 +110,7 @@ and the log lives at `~/Library/Logs/decant.log` instead of `toaiff.log`.
 decant ~/Music/Album              # recurse a folder
 decant track.flac other.wav       # one or more files
 decant --dry-run ~/Music/Album    # preview tags/conversions, write nothing
+decant --keep ~/Music/Album       # convert, but leave the originals in place
 decant --no-enrich ~/Music/Album  # pure transcode, skip all tag enrichment
 decant -- -weird-name.flac        # a path that starts with a dash
 decant --help                     # full usage, flags, env vars and exit codes
@@ -262,18 +278,25 @@ To debug the Finder Quick Action, add `--debug` to its Run Shell Script line
 temporarily — change `exec decant --notify "$@"` to
 `exec decant --notify --debug "$@"`.
 
+The log rotates itself so it can't grow without bound: once it reaches **2 MB**
+the current file is renamed to `decant.log.1` and the run continues in a fresh
+one. Exactly one previous generation is kept — the older `decant.log.1` is
+discarded. If the rotation can't happen (say the directory isn't writable) the
+run carries on and keeps logging; an oversized log is never a reason to fail a
+conversion.
+
 ## Configuration
 
 | Flag | Env | Effect |
 |------|-----|--------|
 | `--no-enrich` | `DECANT_NO_ENRICH` | Pure transcode; skip all tag enrichment. |
 | `--dry-run` | — | Preview the tag/conversion plan; write and trash nothing. |
+| `--keep` | `DECANT_KEEP_ORIGINALS` | Convert without trashing originals (cautious first pass). |
 | `--debug` | `DECANT_DEBUG` | Log every run/conversion/skip, not just errors. |
 | `--notify` | — | Post a completion notification (what the Quick Action uses). |
 | `-h`, `--help` | — | Print the full usage — flags, env vars, exit codes — and exit. |
 | `--version` | — | Print the version and exit. |
 | `--` | — | End of options: every remaining argument is a path. |
-| — | `DECANT_KEEP_ORIGINALS` | Convert without trashing originals (cautious first pass). |
 | — | `DECANT_NO_NOTIFY` | Suppress the completion notification even with `--notify`. |
 | — | `DECANT_NO_SOXR` | Resample with ffmpeg's default engine instead of libsoxr. |
 | — | `DECANT_LOG` | Override the log file path (used by the test suite). |
@@ -291,7 +314,7 @@ conventional [sysexits](https://man.freebsd.org/cgi/man.cgi?sysexits) codes.
 | `1` | At least one file failed to convert (the original is left untouched). |
 | `64` | Usage error: no paths given, or an unrecognised option. |
 | `66` | A given path does not exist. |
-| `69` | ffmpeg/ffprobe are unavailable and could not be installed. |
+| `69` | ffmpeg/ffprobe are unavailable and were not installed. |
 | `77` | Refused a path that is too broad to recurse (a filesystem or home root). |
 
 When one run hits several of these, the most severe wins: `1` over `77` over
@@ -323,9 +346,14 @@ Issues and PRs welcome. Run the test suite before submitting:
 
 It generates fixtures with ffmpeg and exercises depth preservation, bitrate
 capping, metadata and artwork retention, codec classification, stream mapping,
-`ffmpeg` resolution, enrichment + decoy rejection, recursion, skipping,
-logging, and the CLI contract (exit codes, flag parsing) — all
-non-destructively (no files are trashed). CI runs the same suite on every PR.
+`ffmpeg` resolution and its bootstrap, enrichment + decoy rejection, recursion,
+skipping, logging and its rotation, and the CLI contract (exit codes, flag
+parsing). CI runs the same suite on every PR.
+
+Almost every assertion runs with `DECANT_KEEP_ORIGINALS` set, so nothing of
+yours is touched. The exception is the one test that proves `--keep` is what
+preserves an original: it lets decant trash a fixture for real, which leaves a
+single recoverable `decant-selftest-trashme.flac` in your Trash.
 
 The Quick Action is built from [`shortcut/decant.shortcut.plist`](shortcut/).
 After editing it, re-sign the distributable copy — note the input **must** end

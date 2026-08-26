@@ -9,7 +9,7 @@
 # original is moved to the Trash once its output is written successfully.
 #
 # Usage:
-#   decant [--notify] [--debug] [--dry-run] [--no-enrich] [--] PATH [PATH ...]
+#   decant [--notify] [--debug] [--dry-run] [--keep] [--no-enrich] [--] PATH [PATH ...]
 #   decant --help
 #   decant --version
 
@@ -46,6 +46,7 @@ Options:
   --notify        Post a completion notification (used by the Quick Action).
   --debug         Log every run/conversion/skip, not just errors.
   --dry-run       Preview the tag/conversion plan; write and trash nothing.
+  --keep          Convert without trashing the originals.
   --no-enrich     Pure transcode; skip all tag enrichment.
   --version       Print the version and exit.
   -h, --help      Print this help and exit.
@@ -54,7 +55,7 @@ Options:
 Environment:
   DECANT_DEBUG            Same as --debug.
   DECANT_NO_ENRICH        Same as --no-enrich.
-  DECANT_KEEP_ORIGINALS   Convert without trashing the originals.
+  DECANT_KEEP_ORIGINALS   Same as --keep.
   DECANT_NO_NOTIFY        Suppress the notification even with --notify.
   DECANT_NO_SOXR          Resample with ffmpeg's default engine, not libsoxr.
   DECANT_LOG              Log file path (default ~/Library/Logs/decant.log).
@@ -64,7 +65,7 @@ Exit status:
   1   at least one file failed to convert
   64  usage error: no paths given, or an unrecognised option
   66  a given path does not exist
-  69  ffmpeg/ffprobe are unavailable and could not be installed
+  69  ffmpeg/ffprobe are unavailable and were not installed
   77  refused a path that is too broad to recurse (a filesystem or home root)
 
 Examples:
@@ -94,6 +95,10 @@ if (( ! HIDDEN_DISPATCH )); then
       --notify)    NOTIFY=1 ;;
       --debug)     DEBUG=1 ;;
       --dry-run)   DRYRUN=1 ;;
+      # The flag form of DECANT_KEEP_ORIGINALS. Setting the variable rather than
+      # a second one keeps a single source of truth for "do not trash", so the
+      # flag and the env var can never disagree.
+      --keep)      DECANT_KEEP_ORIGINALS=1 ;;
       --no-enrich) ENRICH=0 ;;
       --version)   print -r -- "decant $DECANT_VERSION"; exit 0 ;;
       -h|--help)   usage; exit 0 ;;
@@ -114,6 +119,12 @@ if (( ! HIDDEN_DISPATCH )); then
   fi
 fi
 
+# Globals that one function fills in for another to read: build_meta_args sets
+# the first three, process_file the encoder options, convert_file the two
+# outcome flags. Declared here so the hand-off is stated rather than implied.
+typeset -ga META_ARGS META_PLAN ENC_EXTRA
+typeset -g  ART_INPUT CONVERT_ERR ART_DROPPED
+
 typeset -i converted=0 skipped=0 failed=0 previewed=0 missing=0 refused=0
 
 # Skips are ordinary, so only real problems change the status. When several
@@ -130,10 +141,32 @@ run_status() {
 LOG_FILE="${DECANT_LOG:-$HOME/Library/Logs/decant.log}"
 mkdir -p "${LOG_FILE:h}" 2>/dev/null
 
+# zsh's own strftime/zstat, so neither timestamping a line nor sizing the log
+# costs a fork — a --debug run over a large library logs once per file.
+zmodload zsh/datetime
+zmodload -F zsh/stat b:zstat
+
+# The log is appended to forever, so cap it: once it reaches 2 MB the current
+# file becomes decant.log.1 (one generation kept, the older one discarded) and
+# this run continues into a fresh file. Checked once per run — on the first line
+# written, so nothing this run logs can land in the file being rotated away.
+# A rotation that cannot happen is never fatal: an oversized log is a far better
+# outcome than a failed conversion.
+typeset -i LOG_MAX_BYTES=2097152 LOG_ROTATE_CHECKED=0
+rotate_log() {
+  LOG_ROTATE_CHECKED=1
+  local -a st
+  zstat -A st +size "$LOG_FILE" 2>/dev/null || return 0
+  (( st[1] >= LOG_MAX_BYTES )) && mv -f -- "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null
+  return 0
+}
+
 # Errors (FAILED / REFUSED / MISSING) are logged always. Everything else
 # (per-file conversions, skips, run markers) only with --debug / DECANT_DEBUG.
 log_line() {
-  print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE" 2>/dev/null
+  (( LOG_ROTATE_CHECKED )) || rotate_log
+  local ts; strftime -s ts '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS
+  print -r -- "$ts $1" >> "$LOG_FILE" 2>/dev/null
 }
 log_debug() {
   (( DEBUG )) && log_line "$1"
@@ -149,19 +182,51 @@ summary_line() {
   (( ${#parts} )) && print -r -- "${(j: · :)parts}" || print -r -- "no audio files to convert"
 }
 
+notify() {
+  [[ -n "${DECANT_NO_NOTIFY:-}" ]] && return 0
+  /usr/bin/osascript \
+    -e 'on run argv' \
+    -e 'display notification (item 1 of argv) with title "Decant"' \
+    -e 'end run' \
+    "$1" >/dev/null 2>&1
+}
+
+# ffmpeg is missing and this run cannot get it. Say so on every channel the
+# caller might be listening to: stderr for a terminal, the notification for the
+# Quick Action (whose stderr goes to a file nobody reads), the log for later.
+no_tools() {
+  print -u2 -- "decant: $1"
+  print -u2 -- "        $2"
+  (( NOTIFY )) && notify "$1 $2"
+  log_line "NO FFMPEG :: $1 $2"
+  exit 69
+}
+
 ensure_tools() {
   if (( $+commands[ffmpeg] && $+commands[ffprobe] )); then
     return 0
   fi
   if (( ! $+commands[brew] )); then
-    print -u2 "decant: ffmpeg/ffprobe not found and Homebrew is unavailable to install them."
-    print -u2 "        Install Homebrew (https://brew.sh) or ffmpeg, then retry."
-    exit 69
+    no_tools "ffmpeg/ffprobe not found and Homebrew is unavailable to install them." \
+             "Install Homebrew (https://brew.sh) or ffmpeg, then retry."
   fi
-  print -u2 "decant: installing ffmpeg via Homebrew…"
+  # 'brew install ffmpeg' downloads hundreds of megabytes over several minutes.
+  # Without a terminal (Quick Action, cron, CI) there is nobody to consent and
+  # nowhere to show progress — a right-click would simply appear to hang — so
+  # name the command the user should run and stop.
+  if [[ ! -t 0 ]]; then
+    no_tools "ffmpeg/ffprobe not found." \
+             "Run 'brew install ffmpeg', then retry."
+  fi
+  print -u2 -n -- "decant: ffmpeg/ffprobe not found. Install ffmpeg via Homebrew now (several hundred MB)? [y/N] "
+  local reply; read -r reply
+  if [[ "${reply:l}" != (y|yes) ]]; then
+    no_tools "ffmpeg was not installed." \
+             "Run 'brew install ffmpeg' when you are ready, then retry."
+  fi
   if ! brew install ffmpeg; then
-    print -u2 "decant: 'brew install ffmpeg' failed."
-    exit 69
+    no_tools "'brew install ffmpeg' failed." \
+             "Install ffmpeg manually, then retry."
   fi
 }
 
@@ -773,12 +838,6 @@ fi
 print -u2 -- "decant: $(summary_line)"
 log_debug "RUN done: ${converted} converted, ${skipped} skipped, ${failed} failed"
 
-if (( NOTIFY )) && [[ -z "${DECANT_NO_NOTIFY:-}" ]]; then
-  /usr/bin/osascript \
-    -e 'on run argv' \
-    -e 'display notification (item 1 of argv) with title "Decant"' \
-    -e 'end run' \
-    "$(summary_line)" >/dev/null 2>&1
-fi
+(( NOTIFY )) && notify "$(summary_line)"
 
 run_status

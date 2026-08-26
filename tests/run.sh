@@ -591,7 +591,7 @@ assert_eq   "-h prints exactly the same usage as --help" \
             "$HELP_OUT" "$("$DECANT" -h)"
 assert_eq   "usage goes to stdout, leaving stderr clean" "" \
             "$("$DECANT" --help 2>&1 >/dev/null)"
-for FLAG in --notify --debug --dry-run --no-enrich --version '-h, --help'; do
+for FLAG in --notify --debug --dry-run --keep --no-enrich --version '-h, --help'; do
   assert_true "--help documents $FLAG" grep -qF -- "$FLAG" <<< "$HELP_OUT"
 done
 assert_true "--help documents the -- end-of-options marker" \
@@ -938,6 +938,210 @@ ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=450:dur
 DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$LD/-dash.flac" >/dev/null 2>&1
 assert_true "a leading-dash file passed as an argument is treated as a path" \
             test -f "$LD/-dash.aiff"
+mkflac() { ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=$2:duration=1" -c:a flac "$1" }
+
+print -r -- "--keep: the flag form of DECANT_KEEP_ORIGINALS"
+KP="$WORK/keep"; mkdir -p "$KP"
+for N in flag env both order dry; do mkflac "$KP/$N.flac" 490; done
+DECANT_LOG="$LOG" "$DECANT" --keep "$KP/flag.flac" >/dev/null 2>&1
+assert_eq   "--keep is a real option, not an unknown one" "0" "$?"
+assert_true "--keep preserves the original" \
+            test -f "$KP/flag.flac"
+assert_true "...and still writes the conversion" \
+            test -f "$KP/flag.aiff"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$KP/env.flac" >/dev/null 2>&1
+assert_true "DECANT_KEEP_ORIGINALS preserves the original exactly as --keep does" \
+            test -f "$KP/env.flac"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --keep "$KP/both.flac" >/dev/null 2>&1
+assert_eq   "flag and env var together exit 0" "0" "$?"
+assert_true "...and the original survives both being set" \
+            test -f "$KP/both.flac"
+DECANT_LOG="$LOG" "$DECANT" "$KP/order.flac" --keep >/dev/null 2>&1
+assert_true "--keep works after the path, like every other flag" \
+            test -f "$KP/order.flac"
+DECANT_LOG="$LOG" "$DECANT" --keep --dry-run "$KP/dry.flac" >/dev/null 2>&1
+assert_eq   "--keep combined with --dry-run exits 0" "0" "$?"
+# The one place the suite lets decant really trash something: proving --keep
+# changes the outcome needs a run without it. HOME points at a scratch directory
+# so the ~/.Trash fallback stays inside the sandbox; when the NSFileManager path
+# wins instead the fixture lands in the real Trash — recoverable, and named to
+# be recognisable as test debris.
+TH="$WORK/trashhome"; mkdir -p "$TH/.Trash"
+mkflac "$KP/decant-selftest-trashme.flac" 491
+HOME="$TH" DECANT_LOG="$LOG" "$DECANT" "$KP/decant-selftest-trashme.flac" >/dev/null 2>&1
+assert_eq   "a run with neither --keep nor the env var exits 0" "0" "$?"
+assert_true "...and really does trash the original, so --keep is what preserves it" \
+            test ! -f "$KP/decant-selftest-trashme.flac"
+assert_true "...leaving its conversion behind" \
+            test -f "$KP/decant-selftest-trashme.aiff"
+
+print -r -- "log rotation: the log cannot grow forever"
+RL="$WORK/rotate"; mkdir -p "$RL"
+for N in 1 2 3 4 5 6 7; do mkflac "$RL/t$N.flac" $(( 492 + N )); done
+# #given a log of an exact byte size whose first line identifies the generation
+make_log() {
+  local f="$1"; local -i bytes="$2"
+  print -r -- "PREVIOUS GENERATION" > "$f"          # exactly 20 bytes
+  head -c $(( bytes - 20 )) /dev/zero | tr '\0' 'x' >> "$f"
+}
+ROT="$RL/rot.log"; make_log "$ROT" 2097152
+DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$ROT" "$DECANT" "$RL/t1.flac" >/dev/null 2>&1
+assert_eq   "a run over an oversized log still exits 0" "0" "$?"
+assert_true "a log at the 2MB threshold is rotated to <log>.1" \
+            grep -q "PREVIOUS GENERATION" "$ROT.1"
+assert_true "the live log is a fresh, small file" \
+            test "$(wc -c < "$ROT")" -lt 2097152
+assert_true "this run's own lines land in the new file" \
+            grep -q "CONVERTED" "$ROT"
+assert_eq   "...and none of the rotated content came with them" "0" \
+            "$(grep -c 'PREVIOUS GENERATION' "$ROT")"
+make_log "$ROT" 2097152
+print -r -- "SECOND GENERATION" >> "$ROT"
+DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$ROT" "$DECANT" "$RL/t2.flac" >/dev/null 2>&1
+assert_true "a second rotation replaces <log>.1 rather than stacking up" \
+            grep -q "SECOND GENERATION" "$ROT.1"
+assert_true "...so only one previous generation is ever kept" \
+            test ! -e "$ROT.2"
+UNDER="$RL/under.log"; make_log "$UNDER" 2097151
+DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$UNDER" "$DECANT" "$RL/t3.flac" >/dev/null 2>&1
+assert_true "one byte under the threshold is not rotated" \
+            test ! -e "$UNDER.1"
+SMALL="$RL/small.log"; make_log "$SMALL" 4096
+DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$SMALL" "$DECANT" "$RL/t4.flac" >/dev/null 2>&1
+assert_true "a small log is left alone (no <log>.1)" \
+            test ! -e "$SMALL.1"
+assert_true "...and is appended to, not replaced" \
+            grep -q "PREVIOUS GENERATION" "$SMALL"
+assert_true "...with this run's lines added" \
+            grep -q "CONVERTED" "$SMALL"
+
+print -r -- "log rotation: a log that cannot be rotated never fails the run"
+# An unwritable directory blocks the rename but not the append, so the run has
+# to finish normally with an oversized log rather than fall over.
+ROD="$WORK/rotate-ro"; mkdir -p "$ROD"
+RODLOG="$ROD/stuck.log"; make_log "$RODLOG" 2097152
+chmod a-w "$ROD"
+DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$RODLOG" "$DECANT" "$RL/t5.flac" >/dev/null 2>&1
+assert_eq   "a rotation that cannot happen does not fail the run" "0" "$?"
+assert_true "...no half-rotated generation is left behind" \
+            test ! -e "$RODLOG.1"
+assert_true "...and this run's lines are still logged" \
+            grep -q "CONVERTED" "$RODLOG"
+assert_true "...and the file it could not rotate is intact" \
+            grep -q "PREVIOUS GENERATION" "$RODLOG"
+chmod u+w "$ROD"
+ROF="$RL/readonly.log"; print -r -- "PREVIOUS GENERATION" > "$ROF"; chmod a-w "$ROF"
+DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$ROF" "$DECANT" "$RL/t6.flac" >/dev/null 2>&1
+assert_eq   "an unwritable log file does not fail the run either" "0" "$?"
+assert_true "...and the conversion still happens" \
+            test -f "$RL/t6.aiff"
+chmod u+w "$ROF"
+NEWLOG="$RL/deep/nested/new.log"
+DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$NEWLOG" "$DECANT" "$RL/t7.flac" >/dev/null 2>&1
+assert_eq   "a DECANT_LOG under a directory that does not exist exits 0" "0" "$?"
+assert_true "...and the directory is created with the log inside it" \
+            grep -q "CONVERTED" "$NEWLOG"
+
+print -r -- "log format: timestamps unchanged by dropping the date(1) fork"
+TS="$RL/ts.log"; : > "$TS"
+for N in 1 2 3; do mkflac "$RL/ts$N.flac" $(( 500 + N )); done
+T_BEFORE="$(date '+%Y-%m-%d %H:%M')"
+DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$TS" "$DECANT" "$RL/ts1.flac" >/dev/null 2>&1
+T_AFTER="$(date '+%Y-%m-%d %H:%M')"
+assert_eq   "no logged line deviates from 'YYYY-MM-DD HH:MM:SS '" "0" \
+            "$(grep -cvE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} ' "$TS")"
+assert_true "the RUN marker keeps its exact shape" \
+            grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} RUN start: ' "$TS"
+TS_HEAD="$(head -1 "$TS" | cut -c1-16)"
+if [[ "$TS_HEAD" == "$T_BEFORE" || "$TS_HEAD" == "$T_AFTER" ]]; then TS_MATCH=yes; else TS_MATCH=no; fi
+assert_eq   "the timestamp still reads exactly as date(1) writes it" "yes" "$TS_MATCH"
+
+print -r -- "log: concurrent runs append without losing or mangling lines"
+CC="$RL/concurrent.log"; : > "$CC"
+for N in 1 2 3 4 5 6; do mkflac "$RL/cc$N.flac" $(( 510 + N )); done
+for N in 1 2 3 4 5 6; do
+  DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$CC" "$DECANT" "$RL/cc$N.flac" >/dev/null 2>&1 &
+done
+wait
+assert_eq   "every concurrent run logged its conversion" "6" \
+            "$(grep -c 'CONVERTED' "$CC")"
+assert_eq   "no line was interleaved or truncated" "0" \
+            "$(grep -cvE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} ' "$CC")"
+
+print -r -- "ffmpeg bootstrap: never installs hundreds of MB behind your back"
+# decant adds the Homebrew bin directories to its own PATH, so no PATH the
+# caller sets can hide a real ffmpeg from it. Exercise the missing-ffmpeg branch
+# on a copy with every such assignment replaced by the inherited PATH — the only
+# way to reach it without touching the machine's actual installation.
+NT="$WORK/notools"; mkdir -p "$NT"
+mkflac "$NT/t.flac" 520
+awk '/\/opt\/homebrew\/bin/ && /path[+]?=\(/ {
+       match($0, /^[[:blank:]]*/)
+       print substr($0, 1, RLENGTH) "path=(${(s.:.)PATH})"
+       next
+     }
+     { print }' "$DECANT" > "$NT/decant"
+chmod +x "$NT/decant"
+assert_true "the fixture really does neutralise the Homebrew PATH additions" \
+            grep -qF 'path=(${(s.:.)PATH})' "$NT/decant"
+assert_eq   "...leaving no assignment that could still reach a real ffmpeg" "0" \
+            "$(grep -cE '^[[:blank:]]*path[+]?=.*/opt/homebrew/bin' "$NT/decant")"
+# A brew that records being run instead of installing anything: if decant ever
+# calls it unasked, the marker file proves it.
+print -rl -- '#!/bin/sh' 'echo called >> "$BREW_MARKER"' > "$NT/brew"
+chmod +x "$NT/brew"
+NT_PATH="$NT:/usr/bin:/bin"
+assert_eq   "the fixture PATH really has no ffmpeg on it" "" \
+            "$(PATH="$NT_PATH" /usr/bin/which ffmpeg)"
+NTLOG="$WORK/notools.log"; : > "$NTLOG"
+NT_ERR="$(BREW_MARKER="$NT/called" PATH="$NT_PATH" DECANT_LOG="$NTLOG" \
+          "$NT/decant" "$NT/t.flac" 2>&1 >/dev/null </dev/null)"
+assert_eq   "no ffmpeg and no TTY exits 69 instead of installing" "69" "$?"
+assert_true "brew is never invoked when there is no terminal to ask" \
+            test ! -e "$NT/called"
+assert_true "the error names the command to run" \
+            grep -qF -- "brew install ffmpeg" <<< "$NT_ERR"
+assert_true "the failure is logged like every other error" \
+            grep -q "NO FFMPEG" "$NTLOG"
+assert_true "nothing is converted when the tools are missing" \
+            test ! -f "$NT/t.aiff"
+# --notify silences stdout/stderr for the Quick Action, so a tool-missing
+# message has to reach the user before that redirect — and via the notification.
+: > "$NTLOG"
+NTN_ERR="$(BREW_MARKER="$NT/called-notify" PATH="$NT_PATH" DECANT_NO_NOTIFY=1 DECANT_LOG="$NTLOG" \
+           "$NT/decant" --notify "$NT/t.flac" 2>&1 >/dev/null </dev/null)"
+assert_eq   "--notify with no ffmpeg still exits 69" "69" "$?"
+assert_true "the message is not swallowed by --notify's output redirect" \
+            grep -qF -- "brew install ffmpeg" <<< "$NTN_ERR"
+assert_true "...and it reaches the log, the channel a Quick Action user can read" \
+            grep -q "NO FFMPEG" "$NTLOG"
+assert_true "--notify does not make brew run unasked either" \
+            test ! -e "$NT/called-notify"
+assert_eq   "the no-brew fixture PATH has no brew on it" "" \
+            "$(PATH="/usr/bin:/bin" /usr/bin/which brew)"
+NB_ERR="$(PATH="/usr/bin:/bin" DECANT_LOG="$NTLOG" "$NT/decant" "$NT/t.flac" 2>&1 >/dev/null </dev/null)"
+assert_eq   "no ffmpeg and no Homebrew exits 69" "69" "$?"
+assert_true "...and points at Homebrew's install page" \
+            grep -qF -- "https://brew.sh" <<< "$NB_ERR"
+
+print -r -- "ffmpeg bootstrap: with a terminal, it asks first"
+# script(1) hands decant a real pty — the only way to reach the interactive
+# branch. The pauses keep the answer ahead of the EOF that follows it.
+{ sleep 0.5; print -r -- n; sleep 0.5 } | \
+  BREW_MARKER="$NT/called-tty-n" PATH="$NT_PATH" DECANT_LOG="$NTLOG" \
+  script -q /dev/null "$NT/decant" "$NT/t.flac" > "$NT/tty-n.out" 2>&1
+assert_eq   "declining the install exits 69" "69" "$?"
+assert_true "a terminal gets asked before anything is downloaded" \
+            grep -qF -- "Install ffmpeg via Homebrew now" "$NT/tty-n.out"
+assert_true "answering no leaves brew unrun" \
+            test ! -e "$NT/called-tty-n"
+assert_true "...and says what to run instead" \
+            grep -qF -- "brew install ffmpeg" "$NT/tty-n.out"
+{ sleep 0.5; print -r -- y; sleep 0.5 } | \
+  BREW_MARKER="$NT/called-tty-y" PATH="$NT_PATH" DECANT_LOG="$NTLOG" \
+  script -q /dev/null "$NT/decant" "$NT/t.flac" > "$NT/tty-y.out" 2>&1
+assert_true "answering yes is what actually runs brew install" \
+            test -e "$NT/called-tty-y"
 
 rm -rf "$WORK"
 
