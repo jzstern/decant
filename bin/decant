@@ -9,7 +9,8 @@
 # original is moved to the Trash once its output is written successfully.
 #
 # Usage:
-#   decant [--notify] [--debug] [--dry-run] [--no-enrich] PATH [PATH ...]
+#   decant [--notify] [--debug] [--dry-run] [--no-enrich] [--] PATH [PATH ...]
+#   decant --help
 #   decant --version
 
 emulate -L zsh
@@ -28,32 +29,100 @@ DRYRUN=0
 ENRICH=1
 [[ -n "${DECANT_DEBUG:-}" ]] && DEBUG=1
 [[ -n "${DECANT_NO_ENRICH:-}" ]] && ENRICH=0
-while true; do
-  case "${1:-}" in
-    --notify)    NOTIFY=1; shift ;;
-    --debug)     DEBUG=1; shift ;;
-    --dry-run)   DRYRUN=1; shift ;;
-    --no-enrich) ENRICH=0; shift ;;
-    --version)   print -r -- "decant $DECANT_VERSION"; exit 0 ;;
-    *) break ;;
-  esac
-done
 
-if (( $# == 0 )); then
-  print -u2 "usage: decant [--notify] [--debug] [--dry-run] [--no-enrich] PATH [PATH ...]"
-  print -u2 "       decant --version"
-  exit 64
+usage() {
+  print -r -- "decant $DECANT_VERSION — lossless audio → AIFF, lossy .m4a/.opus → MP3.
+
+usage: decant [OPTIONS] PATH [PATH ...]
+
+Options:
+  --notify        Post a completion notification (used by the Quick Action).
+  --debug         Log every run/conversion/skip, not just errors.
+  --dry-run       Preview the tag/conversion plan; write and trash nothing.
+  --no-enrich     Pure transcode; skip all tag enrichment.
+  --version       Print the version and exit.
+  -h, --help      Print this help and exit.
+  --              Treat every remaining argument as a path.
+
+Environment:
+  DECANT_DEBUG            Same as --debug.
+  DECANT_NO_ENRICH        Same as --no-enrich.
+  DECANT_KEEP_ORIGINALS   Convert without trashing the originals.
+  DECANT_NO_NOTIFY        Suppress the notification even with --notify.
+  DECANT_LOG              Log file path (default ~/Library/Logs/decant.log).
+
+Exit status:
+  0   nothing was left undone — conversions, skips and dry runs all count
+  1   at least one file failed to convert
+  64  usage error: no paths given, or an unrecognised option
+  66  a given path does not exist
+  69  ffmpeg/ffprobe are unavailable and could not be installed
+  77  refused a path that is too broad to recurse (a filesystem or home root)
+
+Examples:
+  decant ~/Music/Album              # recurse a folder
+  decant track.flac other.wav       # one or more files
+  decant --dry-run ~/Music/Album    # preview the plan, write nothing
+  decant -- -weird-name.flac        # a path that starts with a dash"
+}
+
+# The hidden diagnostic dispatches at the foot of the script are matched on the
+# raw first argument and can only run once their helper functions are defined,
+# so option parsing has to leave them (and the rest of the line) alone.
+typeset -i HIDDEN_DISPATCH=0
+case "${1:-}" in
+  --check-root|--detect-catalog|--derive-track-disc|--normalize-feat|--mp3-bitrate) HIDDEN_DISPATCH=1 ;;
+esac
+
+typeset -a TARGETS
+typeset -i END_OF_OPTS=0
+if (( ! HIDDEN_DISPATCH )); then
+  # Options are recognised anywhere before "--"; everything else is a path.
+  # Iterating rather than shifting keeps "$@" intact for the RUN start log line.
+  for arg in "$@"; do
+    if (( END_OF_OPTS )); then TARGETS+=("$arg"); continue; fi
+    case "$arg" in
+      --notify)    NOTIFY=1 ;;
+      --debug)     DEBUG=1 ;;
+      --dry-run)   DRYRUN=1 ;;
+      --no-enrich) ENRICH=0 ;;
+      --version)   print -r -- "decant $DECANT_VERSION"; exit 0 ;;
+      -h|--help)   usage; exit 0 ;;
+      --)          END_OF_OPTS=1 ;;
+      # A mistyped flag used to fall through and be treated as a filename, so a
+      # typo looked like a clean run. A bare "-" is left as a path.
+      -?*)         print -u2 -- "decant: unknown option: $arg"
+                   print -u2 -- "       try 'decant --help' for usage"
+                   exit 64 ;;
+      *)           TARGETS+=("$arg") ;;
+    esac
+  done
+
+  if (( ${#TARGETS} == 0 )); then
+    print -u2 -- "usage: decant [OPTIONS] PATH [PATH ...]"
+    print -u2 -- "       try 'decant --help' for usage"
+    exit 64
+  fi
 fi
 
-typeset -i converted=0 skipped=0 failed=0 previewed=0
+typeset -i converted=0 skipped=0 failed=0 previewed=0 missing=0 refused=0
+
+# Skips are ordinary, so only real problems change the status. When several
+# occur in one run the most severe wins, in this order.
+run_status() {
+  (( failed ))  && return 1
+  (( refused )) && return 77
+  (( missing )) && return 66
+  return 0
+}
 
 # One central, always-appended log regardless of where the action is run from.
 # (DECANT_LOG only overrides the path for the test suite.)
 LOG_FILE="${DECANT_LOG:-$HOME/Library/Logs/decant.log}"
 mkdir -p "${LOG_FILE:h}" 2>/dev/null
 
-# Errors (FAILED / REFUSED) are logged always. Everything else (per-file
-# conversions, skips, run markers) is logged only with --debug / DECANT_DEBUG.
+# Errors (FAILED / REFUSED / MISSING) are logged always. Everything else
+# (per-file conversions, skips, run markers) only with --debug / DECANT_DEBUG.
 log_line() {
   print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE" 2>/dev/null
 }
@@ -158,7 +227,10 @@ source_bitrate() {
 # encodes at 32.
 mp3_bitrate_for() {
   local bps="$1" r
-  if [[ -n "$bps" ]]; then
+  # Only a plain digit string is a bitrate. zsh's arithmetic context expands a
+  # non-numeric operand as a variable *name* and keeps expanding recursively, so
+  # anything else has to be rejected here rather than reaching the comparison.
+  if [[ "$bps" == <-> ]]; then
     for r in 320 256 224 192 160 128 112 96 80 64 56 48 40 32; do
       (( bps >= r * 1000 )) && { print -r -- "$r"; return }
     done
@@ -520,10 +592,14 @@ is_forbidden_root() {
 
 process_path() {
   local p="$1"
+  # The output path is derived from the input, and ffmpeg has no way to be told
+  # that an *output* starting with a dash is a filename rather than an option.
+  # Anchoring to the cwd here is what makes `decant -- -foo.flac` convertible.
+  [[ "$p" == -* ]] && p="./$p"
   if is_forbidden_root "$p"; then
     print -u2 "decant: refusing to recurse '$p' (too broad — point me at a file or an album folder)"
     log_line "REFUSED (forbidden root) $p"
-    return
+    (( refused++ )); return
   fi
   if [[ -d "$p" ]]; then
     local file
@@ -534,6 +610,8 @@ process_path() {
     process_file "$p"
   else
     print -u2 "decant: not found: $p"
+    log_line "MISSING $p"
+    (( missing++ ))
   fi
 }
 
@@ -567,13 +645,13 @@ fi
 
 log_debug "RUN start: $*"
 
-for arg in "$@"; do
+for arg in "${TARGETS[@]}"; do
   process_path "$arg"
 done
 
 if (( DRYRUN )); then
   print -u2 -- "decant: dry run — ${previewed} file(s) would convert, nothing changed"
-  exit 0
+  run_status; exit $?
 fi
 
 # Human-readable summary goes to stderr (discarded entirely in the Quick Action
@@ -590,4 +668,4 @@ if (( NOTIFY )) && [[ -z "${DECANT_NO_NOTIFY:-}" ]]; then
     "$(summary_line)" >/dev/null 2>&1
 fi
 
-(( failed == 0 ))
+run_status

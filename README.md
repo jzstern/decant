@@ -86,12 +86,17 @@ and the log lives at `~/Library/Logs/decant.log` instead of `toaiff.log`.
 ## Use from the terminal
 
 ```sh
-decant ~/Music/Album            # recurse a folder
-decant track.flac other.wav     # one or more files
-decant --dry-run ~/Music/Album  # preview tags/conversions, write nothing
+decant ~/Music/Album              # recurse a folder
+decant track.flac other.wav       # one or more files
+decant --dry-run ~/Music/Album    # preview tags/conversions, write nothing
 decant --no-enrich ~/Music/Album  # pure transcode, skip all tag enrichment
+decant -- -weird-name.flac        # a path that starts with a dash
+decant --help                     # full usage, flags, env vars and exit codes
 decant --version
 ```
+
+Flags may appear anywhere before `--`, so `decant ~/Music/Album --dry-run`
+works too. An unrecognised flag is an error, never a filename.
 
 ## What gets converted
 
@@ -221,9 +226,33 @@ temporarily — change `exec decant --notify "$@"` to
 | `--no-enrich` | `DECANT_NO_ENRICH` | Pure transcode; skip all tag enrichment. |
 | `--dry-run` | — | Preview the tag/conversion plan; write and trash nothing. |
 | `--debug` | `DECANT_DEBUG` | Log every run/conversion/skip, not just errors. |
+| `--notify` | — | Post a completion notification (what the Quick Action uses). |
+| `-h`, `--help` | — | Print the full usage — flags, env vars, exit codes — and exit. |
+| `--version` | — | Print the version and exit. |
+| `--` | — | End of options: every remaining argument is a path. |
 | — | `DECANT_KEEP_ORIGINALS` | Convert without trashing originals (cautious first pass). |
 | — | `DECANT_NO_NOTIFY` | Suppress the completion notification even with `--notify`. |
 | — | `DECANT_LOG` | Override the log file path (used by the test suite). |
+
+### Exit codes
+
+Skipping is normal, not a failure: a run that converts nothing because every
+file was already AIFF, lossy, or unsupported still exits `0`. Only things
+decant was asked to do and *couldn't* produce a non-zero status, using the
+conventional [sysexits](https://man.freebsd.org/cgi/man.cgi?sysexits) codes.
+
+| Code | Meaning |
+|------|---------|
+| `0` | Nothing was left undone — conversions, skips and dry runs all count. |
+| `1` | At least one file failed to convert (the original is left untouched). |
+| `64` | Usage error: no paths given, or an unrecognised option. |
+| `66` | A given path does not exist. |
+| `69` | ffmpeg/ffprobe are unavailable and could not be installed. |
+| `77` | Refused a path that is too broad to recurse (a filesystem or home root). |
+
+When one run hits several of these, the most severe wins: `1` over `77` over
+`66`. So a script or Shortcut can branch on `decant … || handle "$?"` and trust
+that a typo or a missing file never reads as success.
 
 > **No stray output files:** as a Finder Quick Action the script runs with
 > `--notify` and no terminal, so it writes nothing to stdout/stderr — which the
@@ -250,8 +279,9 @@ Issues and PRs welcome. Run the test suite before submitting:
 
 It generates fixtures with ffmpeg and exercises depth preservation, bitrate
 capping, metadata and artwork retention, enrichment + decoy rejection,
-recursion, skipping, and logging — all non-destructively (no files are
-trashed). CI runs the same suite on every PR.
+recursion, skipping, logging, and the CLI contract (exit codes, flag parsing)
+— all non-destructively (no files are trashed). CI runs the same suite on
+every PR.
 
 The Quick Action is built from [`shortcut/decant.shortcut.plist`](shortcut/).
 After editing it, re-sign the distributable copy — note the input **must** end
