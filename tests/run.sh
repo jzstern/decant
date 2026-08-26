@@ -505,6 +505,203 @@ assert_eq   "no arithmetic error leaks out on a variable-shaped input" "" \
 assert_eq   "real digits still cap normally after the guard" "192" \
             "$("$DECANT" --mp3-bitrate 200000)"
 
+# ffmpeg decodes Shorten and DSD but cannot encode either, so no fixture can be
+# generated for them — the classifier is unit-tested through the hidden dispatch
+# instead (same trick as --mp3-bitrate above).
+print -r -- "codec classification (lossless / DSD / lossy)"
+assert_eq   "shorten is lossless, so .shn takes the AIFF path" "lossless" \
+            "$("$DECANT" --classify-codec shorten)"
+assert_eq   "dsd_lsbf is recognised as DSD, not lumped in with lossy" "dsd" \
+            "$("$DECANT" --classify-codec dsd_lsbf)"
+assert_eq   "dsd_msbf is recognised as DSD" "dsd" \
+            "$("$DECANT" --classify-codec dsd_msbf)"
+assert_eq   "dsd_lsbf_planar is recognised as DSD" "dsd" \
+            "$("$DECANT" --classify-codec dsd_lsbf_planar)"
+assert_eq   "dsd_msbf_planar is recognised as DSD" "dsd" \
+            "$("$DECANT" --classify-codec dsd_msbf_planar)"
+assert_eq   "any pcm_* variant is lossless" "lossless" \
+            "$("$DECANT" --classify-codec pcm_f64be)"
+assert_eq   "an unknown codec is never treated as lossless" "lossy" \
+            "$("$DECANT" --classify-codec some_future_codec)"
+assert_eq   "an empty codec is never treated as lossless" "lossy" \
+            "$("$DECANT" --classify-codec '')"
+
+# #given every extension the gate accepts, paired with a codec a file of that
+# extension really holds, and the class that codec must land in. An extension
+# accepted here but classified into no handled path is a dead end: the file is
+# probed and then rejected with a reason that isn't true of it.
+EXT_TABLE=(
+  flac:flac:lossless      wav:pcm_s16le:lossless  wave:pcm_s16le:lossless
+  w64:pcm_s16le:lossless  rf64:pcm_s16le:lossless bwf:pcm_s16le:lossless
+  aif:pcm_s16be:lossless  aiff:pcm_s16be:lossless aifc:pcm_s16be:lossless
+  m4a:alac:lossless       m4b:alac:lossless       mp4:alac:lossless
+  caf:pcm_s16be:lossless  alac:alac:lossless      ape:ape:lossless
+  wv:wavpack:lossless     tak:tak:lossless        tta:tta:lossless
+  mlp:mlp:lossless        thd:truehd:lossless     shn:shorten:lossless
+  dsf:dsd_lsbf:dsd        dff:dsd_msbf:dsd
+  mp3:mp3:lossy           aac:aac:lossy           ogg:vorbis:lossy
+  oga:vorbis:lossy        opus:opus:lossy         wma:wmav2:lossy
+  ac3:ac3:lossy           eac3:eac3:lossy         dts:dca:lossy
+  mka:vorbis:lossy
+)
+
+# Echo the offending rows (nothing when the whole table agrees), so a failure
+# names the extension instead of just the count.
+ext_table_mismatches() {
+  local row ext codec want got
+  local -a bad
+  for row in $EXT_TABLE; do
+    ext="${${(s.:.)row}[1]}"; codec="${${(s.:.)row}[2]}"; want="${${(s.:.)row}[3]}"
+    "$DECANT" --is-audio-ext "$ext" || bad+=("$ext:gate-rejects-it")
+    got="$("$DECANT" --classify-codec "$codec")"
+    [[ "$got" == "$want" ]] || bad+=("$ext/$codec:got-$got-want-$want")
+  done
+  print -r -- "${(j: :)bad}"
+}
+
+# The gate's own list, scraped from the source, so adding an extension without
+# adding a table row fails here instead of silently going untested.
+gate_exts() {
+  sed -n '/^is_audio_ext()/,/^}/p' "$DECANT" |
+    grep -oE '^[[:space:]]+[a-z0-9|]+\) return 0' |
+    sed 's/) return 0//; s/^[[:space:]]*//' | tr '|' '\n' | sort -u
+}
+table_exts() { print -l -- ${EXT_TABLE[@]%%:*} | sort -u }
+
+print -r -- "extension gate and codec classifier agree (no dead extensions)"
+assert_eq   "every accepted extension classifies into a handled path" "" \
+            "$(ext_table_mismatches)"
+assert_eq   "the table covers every extension the gate accepts" "" \
+            "$(comm -23 <(gate_exts) <(table_exts) | tr '\n' ' ' | sed 's/ *$//')"
+assert_eq   "the table lists no extension the gate rejects" "" \
+            "$(comm -13 <(gate_exts) <(table_exts) | tr '\n' ' ' | sed 's/ *$//')"
+assert_true "the unsubstantiated .aifr extension is gone" \
+            test "$("$DECANT" --is-audio-ext aifr; print $?)" -eq 2
+assert_true "a non-audio extension is still rejected" \
+            test "$("$DECANT" --is-audio-ext txt; print $?)" -eq 2
+
+# ffmpeg cannot encode DSD, so write the (fixed-layout, fully specified) DSF
+# header by hand: DSD chunk, fmt chunk, then one 4096-byte block of samples.
+gen_dsf() {
+  /usr/bin/perl -e '
+    my $blk = 4096; my $data = "\x69" x $blk;
+    print "DSD ", pack("Q<", 28), pack("Q<", 28 + 52 + 12 + length($data)), pack("Q<", 0);
+    print "fmt ", pack("Q<", 52), pack("V", 1), pack("V", 0), pack("V", 1), pack("V", 1),
+          pack("V", 2822400), pack("V", 1), pack("Q<", $blk * 8), pack("V", $blk), pack("V", 0);
+    print "data", pack("Q<", 12 + length($data)), $data;
+  ' > "$1"
+}
+
+print -r -- "DSD is recognised and declined for an accurate reason"
+DSD="$WORK/dsd"; mkdir -p "$DSD"
+gen_dsf "$DSD/pure.dsf"
+DSDLOG="$WORK/dsd.log"; : > "$DSDLOG"
+assert_eq   "the hand-built fixture really is DSD" "dsd_lsbf_planar" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$DSD/pure.dsf")"
+DSDOUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$DSDLOG" "$DECANT" "$DSD" 2>&1 >/dev/null)"
+assert_true "no AIFF is written (DSD→PCM would not be bit-exact)" \
+            test ! -f "$DSD/pure.aiff"
+assert_true "the original is left alone" \
+            test -f "$DSD/pure.dsf"
+assert_true "the log gives DSD as the reason, by name" \
+            grep -q "SKIP (DSD, no bit-exact PCM conversion: dsd_lsbf_planar)" "$DSDLOG"
+assert_eq   "DSD is never called lossy/unsupported" "0" \
+            "$(grep -c 'lossy/unsupported' "$DSDLOG")"
+assert_eq   "it counts as a skip, not a failure" \
+            "decant: 1 skipped" "$(tail -1 <<< "$DSDOUT")"
+
+# #given a shim that records itself and then execs the real binary, so the test
+# can tell WHICH ffmpeg the script picked without breaking the conversion
+print -r -- "ffmpeg resolution: the PATH's own ffmpeg wins, Homebrew is a fallback"
+REAL_FFMPEG="$(command -v ffmpeg)"
+REAL_FFPROBE="$(command -v ffprobe)"
+PB="$WORK/pathbin"; mkdir -p "$PB"
+SHIMLOG="$WORK/shim.log"
+make_shim() {
+  cat > "$PB/$1" <<EOF
+#!/bin/sh
+printf '%s\n' "$1" >> "$SHIMLOG"
+exec "$2" "\$@"
+EOF
+  chmod +x "$PB/$1"
+}
+make_shim ffmpeg "$REAL_FFMPEG"
+make_shim ffprobe "$REAL_FFPROBE"
+PS1D="$WORK/path-user"; mkdir -p "$PS1D"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=700:duration=1" -c:a flac "$PS1D/tone.flac"
+: > "$SHIMLOG"
+PATH="$PB:$PATH" DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$PS1D/tone.flac" >/dev/null 2>&1
+assert_true "an ffmpeg already first on PATH is used, not overridden by Homebrew" \
+            test -s "$SHIMLOG"
+assert_true "the run still converts through the caller's ffmpeg" \
+            test -f "$PS1D/tone.aiff"
+
+# #when launched the way a Finder Quick Action is — a minimal PATH with no
+# Homebrew on it at all — the bundled fallback must still find the tools
+PS2D="$WORK/path-gui"; mkdir -p "$PS2D"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=710:duration=1" -c:a flac "$PS2D/tone.flac"
+PATH=/usr/bin:/bin:/usr/sbin:/sbin DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" \
+  "$DECANT" "$PS2D/tone.flac" >/dev/null 2>&1
+if [[ "${REAL_FFMPEG:h}" == (/opt/homebrew/bin|/usr/local/bin) ]]; then
+  assert_true "a GUI-minimal PATH still finds ffmpeg via the Homebrew fallback" \
+              test -f "$PS2D/tone.aiff"
+else
+  print -r -- "  – skipped GUI-PATH fallback (ffmpeg is not in a Homebrew bin dir)"
+fi
+
+# #given sources whose extra streams would make `-map 0` fail outright, silently
+# demoting the file to the audio-only fallback and losing art it really had
+print -r -- "stream mapping: first audio + cover art, never every stream"
+SM="$WORK/streams"; mkdir -p "$SM/folderart"
+mk_two_stream() {
+  ffmpeg -nostdin -hide_banner -loglevel error -y \
+    -f lavfi -i "sine=frequency=300:duration=1" -f lavfi -i "sine=frequency=500:duration=1" \
+    -map 0:a -map 1:a -c:a flac "$1"
+}
+mk_two_stream "$SM/twostream.mka"
+mk_two_stream "$SM/folderart/twostream.mka"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "color=c=green:s=32x32:d=1" -frames:v 1 "$SM/_art.png"
+ffmpeg -nostdin -hide_banner -loglevel error -y \
+  -f lavfi -i "sine=frequency=300:duration=1" -f lavfi -i "sine=frequency=500:duration=1" -i "$SM/_art.png" \
+  -map 0:a -map 1:a -map 2:v -disposition:v attached_pic -c:a flac -c:v copy "$SM/twostream-art.mka"
+mv "$SM/_art.png" "$SM/folderart/cover.png"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=310:duration=1" -c:a flac "$SM/noart.flac"
+SMOUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$SM" 2>&1 >/dev/null)"
+assert_eq   "a two-audio-stream .mka converts (was failing the art-preserving pass)" \
+            "pcm_s16be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$SM/twostream.aiff")"
+assert_eq   "only the first audio stream is kept (AIFF holds exactly one)" "1" \
+            "$(probe -select_streams a -show_entries stream=index -of default=nw=1:nk=1 -- "$SM/twostream.aiff" | grep -c .)"
+assert_eq   "no false 'dropped artwork' note for a source that had none" "0" \
+            "$(grep -c 'dropped unembeddable artwork' <<< "$SMOUT")"
+assert_eq   "every source in the tree converts, none fails" "decant: 4 converted" \
+            "$(tail -1 <<< "$SMOUT")"
+assert_eq   "cover art survives on a multi-audio-stream source" "png" \
+            "$(probe -select_streams v -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$SM/twostream-art.aiff")"
+assert_true "a source with no art converts cleanly" \
+            test -f "$SM/noart.aiff"
+assert_eq   "no art is invented for a source that had none" "" \
+            "$(probe -select_streams v -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$SM/noart.aiff")"
+assert_eq   "folder art still embeds alongside the precise stream mapping" "png" \
+            "$(probe -select_streams v -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$SM/folderart/twostream.aiff")"
+
+print -r -- "awkward filenames (spaces, unicode, quotes, leading dash)"
+FN="$WORK/odd names"; mkdir -p "$FN"
+ODD=("a file with spaces.flac" "ünïcødé — 日本語 🎧.flac" "quote'and\"double.flac" "-leading-dash.flac")
+for n in $ODD; do
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=1" -c:a flac "$FN/$n"
+done
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$FN" >/dev/null 2>&1
+for n in $ODD; do
+  assert_true "converts [$n]" test -f "$FN/${n:r}.aiff"
+done
+# A leading dash must read as a path, not as an option, when passed directly.
+LD="$WORK/lead"; mkdir -p "$LD"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=450:duration=1" -c:a flac "$LD/-dash.flac"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$LD/-dash.flac" >/dev/null 2>&1
+assert_true "a leading-dash file passed as an argument is treated as a path" \
+            test -f "$LD/-dash.aiff"
+
 rm -rf "$WORK"
 
 print -r -- ""

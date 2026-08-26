@@ -31,6 +31,12 @@ never overwrites a tag the source already has; the one exception is normalizing
 - macOS 13 (Ventura) or later — tested on Sequoia and Tahoe
 - [ffmpeg](https://ffmpeg.org) (installed automatically by Homebrew, below)
 
+`decant` uses the first `ffmpeg`/`ffprobe` on your `PATH`, so a build you chose
+deliberately (a static build with extra encoders, MacPorts, Nix) is the one that
+runs. Homebrew's `/opt/homebrew/bin` and `/usr/local/bin` are added as a
+*fallback* only — which is what makes the Finder Quick Action work, since a
+GUI-launched process inherits a minimal `PATH` with no Homebrew on it.
+
 ## Install
 
 ### Homebrew (recommended)
@@ -106,13 +112,19 @@ holding AAC takes the MP3 path.
 
 | Input | Action |
 |-------|--------|
-| FLAC, ALAC, WavPack, Monkey's Audio (APE), TAK, TTA, MLP/TrueHD | convert → AIFF |
+| FLAC, ALAC, WavPack, Monkey's Audio (APE), TAK, TTA, MLP/TrueHD, Shorten | convert → AIFF |
 | WAV / raw PCM | convert → AIFF (uncompressed passthrough) |
 | Already AIFF | skipped |
 | Lossy `.m4a` (AAC), `.opus` | convert → MP3 (bitrate capped at the source's) |
 | MP3, Vorbis, AC3, WMA, … (other lossy) | skipped |
-| DSD (`.dsf`/`.dff`) | skipped (no clean lossless PCM mapping) |
+| DSD (`.dsf`/`.dff`) | skipped — see below |
 | Non-audio files | ignored |
+
+DSD is the one lossless format `decant` declines. Decimating 1-bit sigma-delta
+down to multi-bit PCM is a re-recording, not a copy, so there is no AIFF that
+would still be the same audio — `decant` recognises DSD by name and leaves it
+alone rather than pretending otherwise. Run with `--debug` and the log says so
+explicitly, instead of filing it under "lossy".
 
 ## How quality is preserved
 
@@ -128,10 +140,13 @@ target that is always **≥** the source depth:
 | 32-bit int | `pcm_s32be` |
 | 32/64-bit float | `pcm_f32be` / `pcm_f64be` (AIFF-C) |
 
-Sample rate and channel layout are never touched (no resampling). Tags and
-embedded cover art are carried over via `-map_metadata` and an ID3v2 chunk; if
-the AIFF container rejects an embedded image, the audio still converts and the
-artwork is dropped with a logged note.
+Sample rate and channel layout are never touched (no resampling). AIFF and MP3
+each hold exactly one audio stream, so a source carrying several (an `.mka` with
+alternate mixes, say) contributes its **first** one; everything else the
+container held besides the cover art is left behind. Tags and embedded cover art
+are carried over via `-map_metadata` and an ID3v2 chunk; if the AIFF container
+rejects an embedded image, the audio still converts and the artwork is dropped
+with a logged note.
 
 ### Lossy `.m4a` / `.opus` → MP3
 
@@ -278,10 +293,10 @@ Issues and PRs welcome. Run the test suite before submitting:
 ```
 
 It generates fixtures with ffmpeg and exercises depth preservation, bitrate
-capping, metadata and artwork retention, enrichment + decoy rejection,
-recursion, skipping, logging, and the CLI contract (exit codes, flag parsing)
-— all non-destructively (no files are trashed). CI runs the same suite on
-every PR.
+capping, metadata and artwork retention, codec classification, stream mapping,
+`ffmpeg` resolution, enrichment + decoy rejection, recursion, skipping,
+logging, and the CLI contract (exit codes, flag parsing) — all
+non-destructively (no files are trashed). CI runs the same suite on every PR.
 
 The Quick Action is built from [`shortcut/decant.shortcut.plist`](shortcut/).
 After editing it, re-sign the distributable copy — note the input **must** end

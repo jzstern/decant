@@ -19,9 +19,16 @@ setopt pipefail extended_glob
 DECANT_VERSION="0.2.0"
 
 # GUI-launched processes (Finder Quick Action / Automator) inherit a minimal
-# PATH that omits Homebrew, so ffmpeg/ffprobe/brew would be invisible. Make the
-# script self-sufficient by adding the standard Homebrew bin directories.
-path=(/opt/homebrew/bin /usr/local/bin $path)
+# PATH that omits Homebrew, so ffmpeg/ffprobe/brew would be invisible. Add the
+# standard Homebrew bin directories — but only *ahead* of the inherited PATH
+# when the tools are missing outright, so a deliberately chosen ffmpeg (a static
+# build with extra encoders, MacPorts, Nix, a newer local build) keeps winning
+# wherever the caller already put it first.
+if (( $+commands[ffmpeg] && $+commands[ffprobe] )); then
+  path+=(/opt/homebrew/bin /usr/local/bin)
+else
+  path=(/opt/homebrew/bin /usr/local/bin $path)
+fi
 
 NOTIFY=0
 DEBUG=0
@@ -71,7 +78,8 @@ Examples:
 # so option parsing has to leave them (and the rest of the line) alone.
 typeset -i HIDDEN_DISPATCH=0
 case "${1:-}" in
-  --check-root|--detect-catalog|--derive-track-disc|--normalize-feat|--mp3-bitrate) HIDDEN_DISPATCH=1 ;;
+  --check-root|--detect-catalog|--derive-track-disc|--normalize-feat|--mp3-bitrate \
+    |--is-audio-ext|--classify-codec) HIDDEN_DISPATCH=1 ;;
 esac
 
 typeset -a TARGETS
@@ -163,7 +171,7 @@ ensure_tools() {
 is_audio_ext() {
   case "$1" in
     flac|wav|wave|w64|rf64|bwf|aif|aiff|aifc|m4a|m4b|mp4|caf|alac|ape|wv|tak|tta|mlp|thd|shn|dsf|dff) return 0 ;;
-    mp3|aac|ogg|oga|opus|wma|ac3|eac3|dts|mka|aifr) return 0 ;;
+    mp3|aac|ogg|oga|opus|wma|ac3|eac3|dts|mka) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -172,8 +180,19 @@ is_audio_ext() {
 # Unknown codecs are treated as not-lossless and left untouched.
 is_lossless() {
   case "$1" in
-    flac|alac|wavpack|ape|tak|tta|mlp|truehd) return 0 ;;
+    flac|alac|wavpack|ape|tak|tta|mlp|truehd|shorten) return 0 ;;
     pcm_*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# DSD is lossless, but decimating 1-bit sigma-delta down to multi-bit PCM is a
+# re-recording, not a copy — no AIFF we could write would be the same audio. So
+# .dsf/.dff are recognised and declined by name rather than lumped in with the
+# lossy codecs, whose skip reason would be a plain lie about DSD.
+is_dsd() {
+  case "$1" in
+    dsd_*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -393,7 +412,12 @@ convert_file() {
   ART_DROPPED=0
   local -a inputs map tag_args map_meta
   inputs=(-i "$src")
-  map=(-map 0)
+  # Take the first audio stream plus the cover art, never `-map 0`: AIFF and MP3
+  # hold exactly one audio stream, so a source carrying a second one (or a stray
+  # data stream) is rejected by the muxer and never converts at all. The art is
+  # matched as 0:v:0 rather than by attached_pic disposition because Matroska
+  # carries real cover art without that flag set.
+  map=(-map 0:a:0 -map '0:v:0?')
   if [[ "$out_fmt" == mp3 ]]; then
     tag_args=(-id3v2_version 3)
   else
@@ -424,8 +448,8 @@ convert_file() {
     inputs+=(-i "$ART_INPUT")
     map+=(-map 1:v -disposition:v attached_pic)
   fi
-  # First attempt keeps every stream (audio + embedded/folder cover art) and
-  # applies the enrichment -metadata after -map_metadata so it overrides/adds.
+  # First attempt keeps the audio and the embedded/folder cover art, and applies
+  # the enrichment -metadata after -map_metadata so it overrides/adds.
   if ffmpeg -nostdin -hide_banner -loglevel error -y \
         "${inputs[@]}" "${map[@]}" "${map_meta[@]}" "${META_ARGS[@]}" \
         -c:a "$tgt" "${ENC_EXTRA[@]}" "${art_args[@]}" "${tag_args[@]}" -f "$out_fmt" "$out" 2>/dev/null; then
@@ -434,7 +458,7 @@ convert_file() {
   # Fallback: audio + metadata only (drops art the muxer rejected).
   local err
   err=$(ffmpeg -nostdin -hide_banner -loglevel error -y \
-        -i "$src" -map 0:a "${map_meta[@]}" "${META_ARGS[@]}" \
+        -i "$src" -map 0:a:0 "${map_meta[@]}" "${META_ARGS[@]}" \
         -c:a "$tgt" "${ENC_EXTRA[@]}" "${tag_args[@]}" -f "$out_fmt" "$out" 2>&1) && { ART_DROPPED=1; return 0; }
   CONVERT_ERR="${err//$'\n'/ | }"
   return 1
@@ -468,10 +492,15 @@ process_file() {
   fi
 
   # Lossless sources become AIFF (bit-exact). Lossy .m4a/.opus become MP3 at
-  # a bitrate capped to the source's. Other lossy codecs are left untouched.
+  # a bitrate capped to the source's. DSD is lossless but has no bit-exact PCM
+  # target, so it is declined under its own name. Other lossy codecs are left
+  # untouched.
   local out_fmt
   if is_lossless "$codec"; then
     out_fmt=aiff
+  elif is_dsd "$codec"; then
+    log_debug "SKIP (DSD, no bit-exact PCM conversion: $codec) $src"
+    (( skipped++ )); return
   elif [[ "$ext" == opus || ( "$ext" == m4a && "$codec" == aac ) ]]; then
     out_fmt=mp3
   else
@@ -622,13 +651,22 @@ if [[ "${1:-}" == "--check-root" ]]; then
   is_forbidden_root "${2:-}" && exit 0 || exit 2
 fi
 
-# Hidden dispatches so the pure enrichment parsers can be unit-tested without an
-# ffmpeg run (mirrors --check-root).
+# Hidden dispatches so the pure enrichment parsers and the two gates that decide
+# what gets converted can be unit-tested without an ffmpeg run (mirrors
+# --check-root). ffmpeg decodes but cannot encode Shorten or DSD, so there is no
+# way to generate a fixture for them — this is the only way to test their class.
 case "${1:-}" in
   --detect-catalog)    detect_catalog "${2:-}"; exit 0 ;;
   --derive-track-disc) derive_track_disc "${2:-}"; exit 0 ;;
   --normalize-feat)    normalize_feat "${2:-}"; exit 0 ;;
   --mp3-bitrate)       mp3_bitrate_for "${2:-}"; exit 0 ;;
+  --is-audio-ext)      is_audio_ext "${2:-}" && exit 0 || exit 2 ;;
+  --classify-codec)
+    if   is_lossless "${2:-}"; then print -r -- lossless
+    elif is_dsd "${2:-}";      then print -r -- dsd
+    else                            print -r -- lossy
+    fi
+    exit 0 ;;
 esac
 
 ensure_tools
