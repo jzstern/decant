@@ -1545,6 +1545,175 @@ assert_true "...naming the shortcut to re-import" \
 assert_true "a fresh install says nothing about a toaiff that was never there" \
             test -z "$(grep 'ACTION NEEDED' <<< "$IOUT")"
 
+# ── source probe ────────────────────────────────────────────────────────────
+# Everything decant knows about a source comes out of one ffprobe call that is
+# parsed in the shell. These pin both halves of that: the spawn count (so the
+# probes cannot creep back in one at a time) and the parse (so a tag value can
+# never be mistaken for the structure it sits inside).
+
+# #given a shim that counts ffprobe invocations and then hands off to the real
+# one. decant *appends* the Homebrew directories to its own PATH rather than
+# prepending them whenever ffmpeg and ffprobe already resolve, which is what
+# lets a shim placed first stay first.
+print -r -- "source probe: one ffprobe per source, plus the output check"
+CB="$WORK/countbin"; mkdir -p "$CB"
+CLOG="$WORK/probecount.log"
+count_shim() {
+  print -rl -- '#!/bin/sh' \
+    "printf '%s\\n' $1 >> \"\$DECANT_PROBE_COUNT\"" \
+    "exec \"$2\" \"\$@\"" > "$CB/$1"
+  chmod +x "$CB/$1"
+}
+count_shim ffprobe "$(command -v ffprobe)"
+count_shim ffmpeg "$(command -v ffmpeg)"
+probe_count() {
+  : > "$CLOG"
+  DECANT_PROBE_COUNT="$CLOG" PATH="$CB:$PATH" DECANT_KEEP_ORIGINALS=1 \
+    DECANT_LOG="$LOG" "$DECANT" "$@" >/dev/null 2>&1
+  grep -c '^ffprobe$' "$CLOG"
+}
+PC="$WORK/probes"; mkdir -p "$PC"
+mkflac "$PC/a.flac" 530
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=531:duration=2" \
+  -c:a libopus -b:a 96k "$PC/b.opus"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=532:duration=2" \
+  -c:a aac -b:a 160k "$PC/c.m4a"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=533:duration=1" \
+  -c:a libmp3lame -q:a 4 "$PC/d.mp3"
+assert_eq   "the shim really is the ffprobe decant reaches" "1" \
+            "$(probe_count "$PC/d.mp3")"
+assert_eq   "a lossless source costs one probe, plus one to verify the output" "2" \
+            "$(probe_count "$PC/a.flac")"
+assert_eq   "an m4a carrying its own bit_rate costs no more than that" "2" \
+            "$(probe_count "$PC/c.m4a")"
+# Ogg/Opus stores no stream bit_rate, so the packet-summing fallback is the one
+# extra probe decant still pays — and only these files pay it.
+assert_eq   "an opus pays exactly one extra for the packet-sum fallback" "3" \
+            "$(probe_count "$PC/b.opus")"
+rm -f "$PC/a.aiff" "$PC/b.mp3" "$PC/c.mp3"
+assert_eq   "a dry run over a lossless source is a single probe" "1" \
+            "$(probe_count --dry-run "$PC/a.flac")"
+assert_eq   "…and over an opus, the probe plus its packet sum" "2" \
+            "$(probe_count --dry-run "$PC/b.opus")"
+assert_eq   "…and reading no tags at all does not save a probe or cost one" "1" \
+            "$(probe_count --dry-run --no-enrich "$PC/a.flac")"
+
+print -r -- "source probe: a hostile tag value cannot forge the parse"
+# #given a title that impersonates every marker a line-oriented ffprobe dump
+# has — section wrappers, key=value lines, a flat-writer key path — and breaks
+# the line with newlines, on top of quotes, backslashes, unicode and a tab
+HT="$WORK/hostile"; mkdir -p "$HT"
+HOSTILE=$'Lion Soul (feat. Someone) has=equals "quoted" \\back\\\\slash\n[STREAM]\ncodec_name=EVIL\nTAG:title=FORGED\n[/STREAM]\nstreams.stream.0.tags.title="FORGED"\nünïcødé ✧ $VAR `cmd`\ttab'
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=540:duration=1" \
+  -c:a flac -metadata title="$HOSTILE" "$HT/01 - Hostile.flac"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$HT" >/dev/null 2>&1
+HTOUT="$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$HT/01 - Hostile.aiff")"
+# feat.→ft. is only written back when the parser found the real title, so an
+# exact match here proves it was neither forged, truncated nor mis-unescaped.
+assert_eq   "=, quotes, backslashes, newlines and unicode all survive the parse" \
+            "${HOSTILE//feat./ft.}" "$HTOUT"
+assert_eq   "…the forged 'TAG:title=FORGED' line never becomes the title" "0" \
+            "$(grep -cx 'FORGED' <<< "$HTOUT")"
+assert_eq   "…and the value is not truncated at its first newline" \
+            "$(grep -c '' <<< "$HOSTILE")" "$(grep -c '' <<< "$HTOUT")"
+
+# #given a tag far larger than any line-oriented reader would expect
+BG="$WORK/bigtag"; mkdir -p "$BG"
+BIGT="Lion (feat. X) ${(l:131072::y:)}"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=541:duration=1" \
+  -c:a flac -metadata title="$BIGT" "$BG/01 - Big.flac"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$BG" >/dev/null 2>&1
+assert_eq   "a 128 KB title comes back whole, two chars shorter for feat.→ft." \
+            "$(( ${#BIGT} - 2 ))" \
+            "${#$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$BG/01 - Big.aiff")}"
+
+print -r -- "source probe: where the tags live"
+# #given an .opus, whose Vorbis comments hang off the stream and whose
+# format-level dictionary is empty
+SO="$WORK/streamtags"; mkdir -p "$SO"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=542:duration=2" \
+  -c:a libopus -b:a 96k -metadata title="Stream Only (feat. Y)" "$SO/07 - Stream.opus"
+# #given an .mka with a track tag on the stream and none on the format: the
+# gap is already filled, so nothing may be derived from the "03 - " prefix
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=543:duration=1" \
+  -c:a flac -metadata:s:a:0 track=4 "$SO/03 - StreamTrack.mka"
+# #given a second audio stream that is the only one carrying a title
+ffmpeg -nostdin -hide_banner -loglevel error \
+  -f lavfi -i "sine=frequency=544:duration=1" -f lavfi -i "sine=frequency=545:duration=1" \
+  -map 0:a -map 1:a -c:a flac -metadata:s:a:1 title="Second (feat. Z)" "$SO/09 - TwoAudio.mka"
+# #given a source with no tags whatsoever
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=546:duration=1" \
+  -c:a flac -map_metadata -1 "$SO/06 - Bare.flac"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$SO" >/dev/null 2>&1
+assert_eq   "an opus title is read off the stream, not the empty format tags" \
+            "Stream Only (ft. Y)" \
+            "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$SO/07 - Stream.mp3")"
+assert_eq   "…and the filename still fills the track gap beside it" "7" \
+            "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$SO/07 - Stream.mp3")"
+assert_eq   "a stream-level track counts as present, so none is derived" "" \
+            "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$SO/03 - StreamTrack.aiff")"
+assert_eq   "a title on the second audio stream is found like any other" \
+            "Second (ft. Z)" \
+            "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$SO/09 - TwoAudio.aiff")"
+assert_eq   "a file with no tags at all still gets its track backfilled" "6" \
+            "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$SO/06 - Bare.aiff")"
+assert_eq   "…and no title is invented for it" "" \
+            "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$SO/06 - Bare.aiff")"
+
+print -r -- "source probe: any video stream counts as art, attached picture or not"
+# #given two sources sitting beside a folder cover: one whose video stream is a
+# real picture-carrying attached_pic, one whose video stream is actual video.
+# Both already "have art", so neither may pick up the folder's cover.
+VS="$WORK/videostream"; mkdir -p "$VS/pic" "$VS/vid"
+art_img "$VS/pic/cover.png" red 64
+art_img "$VS/vid/cover.png" red 64
+art_img "$WORK/_vs.png" green 32
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=547:duration=1" -c:a flac "$WORK/_vs.flac"
+ffmpeg -nostdin -hide_banner -loglevel error -i "$WORK/_vs.flac" -i "$WORK/_vs.png" \
+  -map 0:a -map 1:v -c copy -disposition:v attached_pic "$VS/pic/01 - Pic.flac"
+ffmpeg -nostdin -hide_banner -loglevel error \
+  -f lavfi -i "testsrc=size=64x64:rate=10:duration=1" -f lavfi -i "sine=frequency=548:duration=1" \
+  -map 0:v -map 1:a -c:v libx264 -c:a flac "$VS/vid/02 - Vid.mka"
+# A sibling with no video stream at all, to show the folder's cover really was
+# there to be found — the one beside it is passed over for having art already.
+tone_flac "$VS/vid/03 - Plain.flac"
+rm -f "$WORK/_vs.png" "$WORK/_vs.flac"
+VSOUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$VS" 2>&1 >/dev/null)"
+assert_eq   "an attached picture is kept, and the folder cover not pasted over it" "32" \
+            "$(art_width "$VS/pic/01 - Pic.aiff")"
+assert_true "a real video stream still converts its audio" \
+            test -f "$VS/vid/02 - Vid.aiff"
+assert_eq   "…as valid PCM" "pcm_s16be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$VS/vid/02 - Vid.aiff")"
+assert_eq   "…with the video dropped rather than muxed into the AIFF" "" \
+            "$(art_codec "$VS/vid/02 - Vid.aiff")"
+assert_true "…and said so" \
+            grep -q "dropped unembeddable artwork for 02 - Vid.mka" <<< "$VSOUT"
+assert_eq   "the sibling with no video stream does take the folder cover" "64" \
+            "$(art_width "$VS/vid/03 - Plain.aiff")"
+
+print -r -- "source probe: partial and unreadable probe output"
+# #given the two shapes a broken file takes: one ffprobe cannot open at all
+# (it prints nothing), and one it guesses a codec for from the extension and
+# then cannot describe (codec_name=flac, sample_fmt=unknown, duration=N/A)
+PA="$WORK/partial"; mkdir -p "$PA"
+PALOG="$WORK/partial.log"; : > "$PALOG"
+print -r -- "not audio at all, just words" > "$PA/07 - Words.flac"
+mkflac "$WORK/_pa.flac" 549
+head -c 3000 "$WORK/_pa.flac" > "$PA/08 - Cut.flac"
+rm -f "$WORK/_pa.flac"
+PAOUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$PALOG" "$DECANT" "$PA" 2>&1 >/dev/null)"
+PARC=$?
+assert_eq   "a partially-probeable file is skipped, not failed" "decant: 1 skipped" \
+            "$(tail -1 <<< "$PAOUT")"
+assert_true "…and says the audio was unreadable" \
+            grep -q "SKIP (unreadable audio).*07 - Words.flac" "$PALOG"
+assert_true "a file ffprobe cannot open at all is passed over silently" \
+            test ! -f "$PA/08 - Cut.aiff"
+assert_true "…leaving no AIFF for the unreadable one either" \
+            test ! -f "$PA/07 - Words.aiff"
+assert_eq   "…and neither one fails the run" "0" "$PARC"
+
 print -r -- ""
 print -r -- "Results: ${pass} passed, ${fail} failed"
 (( fail == 0 ))
