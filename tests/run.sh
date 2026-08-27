@@ -1904,6 +1904,321 @@ assert_true "…leaving no AIFF for the unreadable one either" \
             test ! -f "$PA/07 - Words.aiff"
 assert_eq   "…and neither one fails the run" "0" "$PARC"
 
+# ── parallelism (--jobs) ────────────────────────────────────────────────────
+# --jobs is opt-in, so the bar it has to clear is not "it goes faster" but
+# "nothing else changes". Everything below runs the same work serially and
+# across workers and insists the two are indistinguishable: same outputs, same
+# decoded audio, same tags, same summary, same exit code. On a tool that trashes
+# originals, a difference here is data loss, not a performance regression.
+
+print -r -- "--jobs: a bad value is a usage error, never silently coerced"
+JV="$WORK/jobs-validate"; mkdir -p "$JV"
+mkflac "$JV/t.flac" 570
+for BAD in 0 00 -1 -3 abc 1.5 8x 1e3 auto2 ' 4 ' ''; do
+  DECANT_LOG="$LOG" "$DECANT" --jobs "$BAD" --dry-run "$JV" >/dev/null 2>&1
+  assert_eq "--jobs [$BAD] exits 64, like any other unusable option" "64" "$?"
+done
+for GOOD in 1 2 8 auto; do
+  DECANT_LOG="$LOG" "$DECANT" --jobs "$GOOD" --dry-run "$JV" >/dev/null 2>&1
+  assert_eq "--jobs [$GOOD] is accepted" "0" "$?"
+done
+DECANT_LOG="$LOG" "$DECANT" --jobs=4 --dry-run "$JV" >/dev/null 2>&1
+assert_eq   "--jobs=N is accepted in the joined form too" "0" "$?"
+DECANT_LOG="$LOG" "$DECANT" --jobs= --dry-run "$JV" >/dev/null 2>&1
+assert_eq   "...but an empty --jobs= is still a usage error" "64" "$?"
+DECANT_LOG="$LOG" "$DECANT" --dry-run "$JV" --jobs >/dev/null 2>&1
+assert_eq   "--jobs with no value after it exits 64" "64" "$?"
+JB_ERR="$(DECANT_LOG="$LOG" "$DECANT" --jobs abc --dry-run "$JV" 2>&1 >/dev/null)"
+assert_true "the error names the offending value" \
+            grep -qF -- "--jobs needs a positive whole number, or 'auto': abc" <<< "$JB_ERR"
+assert_true "...and points at --help, like every other usage error" \
+            grep -qF -- "--help" <<< "$JB_ERR"
+assert_true "a bad --jobs is never reported as a missing path" \
+            test -z "$(grep 'not found' <<< "$JB_ERR")"
+assert_true "a rejected --jobs converts nothing at all" \
+            test ! -f "$JV/t.aiff"
+# An absurd worker count is capped rather than allowed to fork-bomb the machine.
+JB_BIG="$(DECANT_LOG="$LOG" "$DECANT" --jobs 999999 --dry-run "$JV" 2>&1 >/dev/null)"
+assert_eq   "an absurd --jobs still exits 0" "0" "$?"
+assert_true "...having been capped at the documented ceiling" \
+            grep -qF -- "is above the 64-worker ceiling — using 64" <<< "$JB_BIG"
+JB_HUGE="$(DECANT_LOG="$LOG" "$DECANT" --jobs 99999999999999999999 --dry-run "$JV" 2>&1 >/dev/null)"
+assert_eq   "a value too long for zsh arithmetic is capped, not wrapped" "0" "$?"
+assert_true "...and says so" \
+            grep -qF -- "is above the 64-worker ceiling" <<< "$JB_HUGE"
+assert_eq   "...leaking no arithmetic error of its own" "0" \
+            "$(grep -c 'truncated' <<< "$JB_HUGE")"
+DECANT_JOBS=bad DECANT_LOG="$LOG" "$DECANT" --dry-run "$JV" >/dev/null 2>&1
+assert_eq   "DECANT_JOBS is validated exactly like the flag" "64" "$?"
+DECANT_JOBS=4 DECANT_LOG="$LOG" "$DECANT" --dry-run "$JV" >/dev/null 2>&1
+assert_eq   "a usable DECANT_JOBS is accepted" "0" "$?"
+DECANT_JOBS=bad DECANT_LOG="$LOG" "$DECANT" --jobs 2 --dry-run "$JV" >/dev/null 2>&1
+assert_eq   "the flag outranks the variable, so the two cannot disagree" "0" "$?"
+DECANT_LOG="$LOG" "$DECANT" -- --jobs >/dev/null 2>&1
+assert_eq   "after -- the word --jobs is a path, not a flag" "66" "$?"
+assert_true "--help documents --jobs" \
+            grep -qF -- "--jobs" <<< "$HELP_OUT"
+assert_true "--help documents DECANT_JOBS" \
+            grep -qF -- "DECANT_JOBS" <<< "$HELP_OUT"
+assert_true "--help names the worker ceiling rather than hiding it" \
+            grep -qF -- "At most 64 workers" <<< "$HELP_OUT"
+
+print -r -- "--jobs: a parallel run is indistinguishable from a serial one"
+# #given one corpus reaching every outcome the driver has — lossless and lossy
+# conversions, enrichment, folder art, a plain skip, an already-converted skip,
+# a declined DSD, a recovered stub, a hard failure, an ignored non-audio file —
+# and a missing path beside it, so the exit-status contract is exercised too.
+jobs_corpus() {
+  local d="$1" al i
+  al="$d/[ARTKL081] Album (2025)"
+  mkdir -p "$al/CD1" "$d/dirdest.aiff"
+  art_img "$al/cover.jpg" red 64
+  for i in 1 2 3 4 5 6; do
+    ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=$(( 600 + i )):duration=1" \
+      -sample_fmt s32 -bits_per_raw_sample 24 -c:a flac \
+      -metadata title="Tone $i (feat. Someone)" "$al/0$i - Tone $i.flac"
+  done
+  tone_flac "$al/CD1/01 - Deep.flac"
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=607:duration=1" \
+    -c:a pcm_s24le -metadata title="Wav Tone" "$d/tagged.wav"
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=608:duration=2" \
+    -c:a aac -b:a 160k -metadata title="Aac Tone" "$d/pop.m4a"
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=609:duration=2" \
+    -ar 22050 -c:a aac -b:a 48k "$d/lofi.m4a"
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=610:duration=2" \
+    -c:a libopus -b:a 96k -metadata title="Opus Tone" "$d/voice.opus"
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=611:duration=1" \
+    -c:a libmp3lame -q:a 4 "$d/lossy.mp3"
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=612:duration=1" \
+    -c:a pcm_s16be "$d/already.aiff"
+  gen_dsf "$d/pure.dsf"
+  mkflac "$d/stub.flac" 613
+  print -r -- "this is not audio" > "$d/stub.aiff"
+  mkflac "$d/dirdest.flac" 614
+  print -r -- "not audio" > "$d/readme.txt"
+}
+
+# Every output under DIR as "path :: decoded-md5 :: tags" — the whole
+# observable result of a run, in one blob two runs can be compared on. The (.)
+# qualifier keeps the dirdest.aiff *directory* out of it.
+jobs_fingerprint() {
+  local d="$1" f rel
+  for f in "$d"/**/*.(aiff|mp3)(N.); do
+    rel="${f#$d/}"
+    print -r -- "$rel :: $(pcm_md5 "$f") :: $(probe -show_entries format_tags=title,track,grouping -of default=nw=1:nk=1 -- "$f" | tr '\n' '/')"
+  done | sort
+}
+
+JS="$WORK/jobs-serial"; JP="$WORK/jobs-parallel"
+mkdir -p "$JS" "$JP"
+jobs_corpus "$JS"; jobs_corpus "$JP"
+JS_OUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$WORK/js.log" "$DECANT" --jobs 1 "$JS" "$WORK/no-such-file.flac" 2>&1 >/dev/null)"
+JS_RC=$?
+JP_OUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$WORK/jp.log" "$DECANT" --jobs 8 "$JP" "$WORK/no-such-file.flac" 2>&1 >/dev/null)"
+JP_RC=$?
+assert_eq   "both runs agree on the exit code" "$JS_RC" "$JP_RC"
+assert_eq   "...and it is the failing one the corpus earns" "1" "$JP_RC"
+assert_eq   "the summary line is identical" \
+            "$(tail -1 <<< "$JS_OUT")" "$(tail -1 <<< "$JP_OUT")"
+assert_true "...and actually counted work rather than coming back empty" \
+            grep -q "converted" <<< "$(tail -1 <<< "$JP_OUT")"
+assert_eq   "every output matches: same files, same decoded audio, same tags" \
+            "$(jobs_fingerprint "$JS")" "$(jobs_fingerprint "$JP")"
+assert_true "the fingerprint is a real measurement, not an empty string" \
+            test -n "$(jobs_fingerprint "$JP")"
+assert_true "the DSD source is still declined under --jobs" \
+            test ! -f "$JP/pure.aiff"
+assert_eq   "an unusable pre-existing target is still recovered" "pcm_s16be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$JP/stub.aiff")"
+assert_true "a destination that is a directory is still never discarded" \
+            test -d "$JP/dirdest.aiff"
+assert_true "...and its source is left in place" \
+            test -f "$JP/dirdest.flac"
+assert_true "a lossy sibling is still left alone" \
+            test ! -f "$JP/lossy.aiff"
+assert_eq   "enrichment still lands on a parallel run" "ARTKL081" \
+            "$(probe -show_entries format_tags=grouping -of default=nw=1:nk=1 -- "$JP/[ARTKL081] Album (2025)/01 - Tone 1.aiff")"
+assert_eq   "...including the feat. normalisation" "Tone 1 (ft. Someone)" \
+            "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$JP/[ARTKL081] Album (2025)/01 - Tone 1.aiff")"
+assert_eq   "...and the disc folder's walk-up to the album cover" "64" \
+            "$(art_width "$JP/[ARTKL081] Album (2025)/CD1/01 - Deep.aiff")"
+assert_eq   "an off-spec rate is still resampled for CDJs" "44100" \
+            "$(probe -select_streams a:0 -show_entries stream=sample_rate -of default=nw=1:nk=1 -- "$JP/lofi.mp3")"
+assert_eq   "a 24-bit source is still bit-exact through a worker" \
+            "$(pcm_md5 "$JP/[ARTKL081] Album (2025)/02 - Tone 2.flac")" \
+            "$(pcm_md5 "$JP/[ARTKL081] Album (2025)/02 - Tone 2.aiff")"
+# The path-level counters live in the parent, so they have to survive workers
+# reporting into the same totals.
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --jobs 8 "$JV/t.flac" "$WORK/no-such-file.flac" >/dev/null 2>&1
+assert_eq   "a missing path still outranks a clean parallel conversion" "66" "$?"
+assert_true "...and the good file converted anyway" \
+            test -f "$JV/t.aiff"
+DECANT_LOG="$LOG" "$DECANT" --jobs 8 "/" >/dev/null 2>&1
+assert_eq   "a forbidden root is still refused under --jobs" "77" "$?"
+
+print -r -- "--jobs: two sources targeting one destination stay ordered"
+# #given track.flac and track.wav in one folder, both wanting track.aiff. Serial
+# order resolved that: the first converts, the second finds a valid destination
+# and skips. Under --jobs the pair has to land on one worker — racing them would
+# put two ffmpegs on one path and trash both originals.
+CO="$WORK/collide"
+mkcollide() {
+  local d="$1"; mkdir -p "$d"
+  mkflac "$d/track.flac" 650
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=651:duration=1" \
+    -c:a pcm_s16le "$d/track.wav"
+}
+mkcollide "$CO/serial"
+CO_S="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --jobs 1 "$CO/serial" 2>&1 >/dev/null)"
+assert_eq   "serially the pair is one conversion and one skip" \
+            "decant: 1 converted · 1 skipped" "$(tail -1 <<< "$CO_S")"
+CO_WIN="$(pcm_md5 "$CO/serial/track.aiff")"
+for N in 1 2 3; do
+  mkcollide "$CO/par$N"
+  CO_P="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --jobs 8 "$CO/par$N" 2>&1 >/dev/null)"
+  assert_eq "run $N under --jobs 8 is one conversion and one skip too" \
+            "decant: 1 converted · 1 skipped" "$(tail -1 <<< "$CO_P")"
+  assert_eq "...producing the very audio serial chose, not the other source's" \
+            "$CO_WIN" "$(pcm_md5 "$CO/par$N/track.aiff")"
+  assert_eq "...as a clean single-writer file, not two ffmpegs interleaved" "" \
+            "$(decode_errors "$CO/par$N/track.aiff")"
+  assert_true "...of the full source duration" \
+            in_range "$(duration_s "$CO/par$N/track.aiff")" 0.95 1.05
+done
+
+print -r -- "--jobs: the log survives many workers appending at once"
+# #given far more files than workers, so appends really do collide. Short
+# appends to one file are atomic on macOS, but "usually atomic" is not a
+# property to ship a log people debug from.
+JL="$WORK/jobs-log"; mkdir -p "$JL"
+for N in {1..40}; do mkflac "$JL/track $N.flac" $(( 300 + N )); done
+JLOG="$WORK/jobs-concurrent.log"; : > "$JLOG"
+DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$JLOG" "$DECANT" --jobs 16 "$JL" >/dev/null 2>&1
+assert_eq   "a 16-worker run over 40 files exits 0" "0" "$?"
+assert_eq   "all 40 outputs really were written" "40" \
+            "$(print -rl -- "$JL"/*.aiff(N) | grep -c .)"
+assert_eq   "every conversion is logged, exactly 40 lines" "40" \
+            "$(grep -c 'CONVERTED ' "$JLOG")"
+assert_eq   "...one per distinct source, none lost and none duplicated" "40" \
+            "$(grep 'CONVERTED ' "$JLOG" | sed 's/^.* CONVERTED //; s/ -> .*//' | sort -u | grep -c .)"
+assert_eq   "no line was interleaved, truncated or spliced" "0" \
+            "$(grep -cvE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} ' "$JLOG")"
+assert_eq   "...and every CONVERTED line still carries its whole shape" "0" \
+            "$(grep 'CONVERTED ' "$JLOG" | grep -cvE ' CONVERTED .+ -> .+ \[.+\]$')"
+# #given an oversized log and a parallel run: the rotation has to happen once,
+# in the parent, before any worker can race another into renaming it away.
+JR="$WORK/jobs-rotate"; mkdir -p "$JR"
+for N in {1..12}; do mkflac "$JR/r$N.flac" $(( 400 + N )); done
+JROT="$JR/rot.log"; make_log "$JROT" 2097152
+DECANT_KEEP_ORIGINALS=1 DECANT_DEBUG=1 DECANT_LOG="$JROT" "$DECANT" --jobs 12 "$JR" >/dev/null 2>&1
+assert_eq   "a parallel run over an oversized log exits 0" "0" "$?"
+assert_true "the log is rotated once, by the parent" \
+            grep -q "PREVIOUS GENERATION" "$JROT.1"
+assert_true "...leaving no second generation behind" \
+            test ! -e "$JROT.2"
+assert_eq   "...and all twelve workers' lines are in the live log" "12" \
+            "$(grep -c 'CONVERTED ' "$JROT")"
+assert_eq   "...with none of the rotated content among them" "0" \
+            "$(grep -c 'PREVIOUS GENERATION' "$JROT")"
+
+print -r -- "--jobs: --dry-run and --notify behave as they do serially"
+JD="$WORK/jobs-dry"; mkdir -p "$JD"
+for N in {1..8}; do mkflac "$JD/0$N - Tone.flac" $(( 460 + N )); done
+JD_S="$(DECANT_LOG="$LOG" "$DECANT" --jobs 1 --dry-run "$JD" 2>&1 >/dev/null)"
+JD_P="$(DECANT_LOG="$LOG" "$DECANT" --jobs 8 --dry-run "$JD" 2>&1 >/dev/null)"
+assert_eq   "the dry-run tally is identical serial and parallel" \
+            "$(tail -1 <<< "$JD_S")" "$(tail -1 <<< "$JD_P")"
+assert_eq   "...and counts every file" \
+            "decant: dry run — 8 file(s) would convert, nothing changed" "$(tail -1 <<< "$JD_P")"
+assert_eq   "the same plan lines are printed, whatever order they arrive in" \
+            "$(grep 'would convert' <<< "$JD_S" | sort)" \
+            "$(grep 'would convert' <<< "$JD_P" | sort)"
+assert_true "a parallel dry run still writes nothing" \
+            test ! -f "$JD/01 - Tone.aiff"
+assert_eq   "...and leaves every original in place" "8" \
+            "$(print -rl -- "$JD"/*.flac(N) | grep -c .)"
+JQ="$WORK/jobs-qa"; mkdir -p "$JQ"
+for N in {1..6}; do mkflac "$JQ/0$N - Tone.flac" $(( 470 + N )); done
+JQOUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_NO_NOTIFY=1 DECANT_LOG="$LOG" "$DECANT" --notify --jobs 6 "$JQ" 2>&1)"
+assert_eq   "--notify with workers still captures no output at all" "" "$JQOUT"
+assert_eq   "...while converting every file" "6" \
+            "$(print -rl -- "$JQ"/*.aiff(N) | grep -c .)"
+
+print -r -- "--jobs: an interrupt discards every partial and reaps every child"
+# #given sources long enough that every worker is genuinely mid-encode when the
+# signal lands. Only the PARENT is signalled: propagating to the workers, and to
+# the ffmpeg each one is blocked on, is the thing under test. An ffmpeg that
+# outlived the script would carry on writing into a destination the handler had
+# already discarded — the one failure mode that silently corrupts a library.
+JK="$WORK/jobs-kill"; mkdir -p "$JK"
+JKLOG="$WORK/jobs-kill.log"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=300" \
+  -c:a libopus -b:a 96k "$JK/_src.opus"
+for N in 1 2 3 4 5 6; do cp "$JK/_src.opus" "$JK/long$N.opus"; done
+rm -f "$JK/_src.opus"
+print -r -- "keep me" > "$JK/bystander.txt"
+JK_SUMS="$(shasum -a 256 "$JK"/*.opus | sort)"
+
+# Anything still running that names this sandbox on its command line is an
+# orphan by definition, and precise enough to ignore the rest of the machine.
+sandbox_encoders() { pgrep -fl "$JK" 2>/dev/null | grep -cE 'ffmpeg|ffprobe' }
+inflight_mp3s() { print -rl -- "$JK"/*.mp3(N) | grep -c . }
+
+# Start a parallel run, wait until several workers are really encoding, then
+# signal. WHOLE_TREE also signals the children, the way a terminal's Ctrl-C
+# reaches every process in the foreground group at once.
+kill_parallel() {
+  local sig="$1" whole_tree="${2:-}" pid i
+  local -a kids grandkids
+  : > "$JKLOG"
+  rm -f "$JK"/*.mp3(N)
+  DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$JKLOG" "$DECANT" --jobs 6 "$JK" >/dev/null 2>&1 &
+  pid=$!
+  for i in {1..600}; do
+    (( $(inflight_mp3s) >= 3 )) && break
+    sleep 0.05
+  done
+  if [[ -n "$whole_tree" ]]; then
+    kids=(${(f)"$(pgrep -P $pid 2>/dev/null)"}); kids=(${kids:#})
+    for i in $kids; do grandkids+=(${(f)"$(pgrep -P $i 2>/dev/null)"}); done
+    grandkids=(${grandkids:#})
+    kill -$sig $pid $kids $grandkids 2>/dev/null
+  else
+    kill -$sig $pid 2>/dev/null
+  fi
+  wait $pid
+}
+
+kill_parallel TERM
+JK_RC=$?
+assert_eq   "SIGTERM under --jobs exits 128+SIGTERM, as a serial interrupt does" "143" "$JK_RC"
+assert_eq   "…leaving not one half-written output behind" "0" "$(inflight_mp3s)"
+assert_eq   "…and no ffmpeg still running against that folder" "0" "$(sandbox_encoders)"
+assert_eq   "…with every source intact, byte for byte" \
+            "$JK_SUMS" "$(shasum -a 256 "$JK"/*.opus | sort)"
+assert_true "…the unrelated sibling untouched" \
+            test -f "$JK/bystander.txt"
+assert_true "…and the interruption recorded in the log (error tier)" \
+            grep -q "INTERRUPTED (TERM)" "$JKLOG"
+assert_true "…once per destination that was in flight, not once for the run" \
+            test "$(grep -c 'INTERRUPTED (TERM)' "$JKLOG")" -ge 3
+
+kill_parallel INT
+JK_RC=$?
+assert_eq   "SIGINT under --jobs exits 128+SIGINT" "130" "$JK_RC"
+assert_eq   "…discarding every partial too" "0" "$(inflight_mp3s)"
+assert_eq   "…and orphaning no encoder" "0" "$(sandbox_encoders)"
+assert_true "…leaving every source where it was" \
+            test "$(print -rl -- "$JK"/*.opus(N) | grep -c .)" -eq 6
+
+kill_parallel INT whole-tree
+JK_RC=$?
+assert_eq   "a Ctrl-C reaching every process at once still exits 130" "130" "$JK_RC"
+assert_eq   "…still discards every partial" "0" "$(inflight_mp3s)"
+assert_eq   "…still orphans no encoder" "0" "$(sandbox_encoders)"
+assert_eq   "…and still leaves the sources byte-identical" \
+            "$JK_SUMS" "$(shasum -a 256 "$JK"/*.opus | sort)"
+
 print -r -- ""
 print -r -- "Results: ${pass} passed, ${fail} failed"
 (( fail == 0 ))
