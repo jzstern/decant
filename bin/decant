@@ -9,7 +9,7 @@
 # original is moved to the Trash once its output is written successfully.
 #
 # Usage:
-#   decant [--notify] [--debug] [--dry-run] [--keep] [--no-enrich] [--] PATH [PATH ...]
+#   decant [--notify] [--debug] [--dry-run] [--keep] [--no-enrich] [--jobs N] [--] PATH [PATH ...]
 #   decant --help
 #   decant --version
 
@@ -17,6 +17,12 @@ emulate -L zsh
 setopt pipefail extended_glob
 
 DECANT_VERSION="0.2.0"
+
+# Opt-in parallelism, and meant to stay opt-in until concurrency has earned the
+# trust: decant trashes originals, and two ffmpegs racing onto one destination
+# would cost the user both the output and the source that made it.
+typeset -i JOBS=1 JOBS_MAX=64 JOBS_GIVEN=0
+JOBS_REQUEST=""
 
 # GUI-launched processes (Finder Quick Action / Automator) inherit a minimal
 # PATH that omits Homebrew, so ffmpeg/ffprobe/brew would be invisible. Add the
@@ -48,6 +54,8 @@ Options:
   --dry-run       Preview the tag/conversion plan; write and trash nothing.
   --keep          Convert without trashing the originals.
   --no-enrich     Pure transcode; skip all tag enrichment.
+  --jobs N        Convert N files at once. Default 1 (serial); 'auto' is the
+                  machine's logical core count. At most $JOBS_MAX workers.
   --version       Print the version and exit.
   -h, --help      Print this help and exit.
   --              Treat every remaining argument as a path.
@@ -56,6 +64,7 @@ Environment:
   DECANT_DEBUG            Same as --debug.
   DECANT_NO_ENRICH        Same as --no-enrich.
   DECANT_KEEP_ORIGINALS   Same as --keep.
+  DECANT_JOBS             Same as --jobs.
   DECANT_NO_NOTIFY        Suppress the notification even with --notify.
   DECANT_NO_SOXR          Resample with ffmpeg's default engine, not libsoxr.
   DECANT_LOG              Log file path (default ~/Library/Logs/decant.log).
@@ -86,12 +95,17 @@ case "${1:-}" in
 esac
 
 typeset -a TARGETS
-typeset -i END_OF_OPTS=0
+typeset -i END_OF_OPTS=0 WANT_JOBS=0
 if (( ! HIDDEN_DISPATCH )); then
   # Options are recognised anywhere before "--"; everything else is a path.
   # Iterating rather than shifting keeps "$@" intact for the RUN start log line.
   for arg in "$@"; do
     if (( END_OF_OPTS )); then TARGETS+=("$arg"); continue; fi
+    # --jobs is the only option carrying a separate value, and this loop
+    # iterates rather than shifts, so the value is claimed on the pass after
+    # the flag. After "--" the same word is a path, which is why this sits
+    # below the END_OF_OPTS check rather than above it.
+    if (( WANT_JOBS )); then JOBS_REQUEST="$arg"; JOBS_GIVEN=1; WANT_JOBS=0; continue; fi
     case "$arg" in
       --notify)    NOTIFY=1 ;;
       --debug)     DEBUG=1 ;;
@@ -101,6 +115,8 @@ if (( ! HIDDEN_DISPATCH )); then
       # flag and the env var can never disagree.
       --keep)      DECANT_KEEP_ORIGINALS=1 ;;
       --no-enrich) ENRICH=0 ;;
+      --jobs)      WANT_JOBS=1 ;;
+      --jobs=*)    JOBS_REQUEST="${arg#--jobs=}"; JOBS_GIVEN=1 ;;
       --version)   print -r -- "decant $DECANT_VERSION"; exit 0 ;;
       -h|--help)   usage; exit 0 ;;
       --)          END_OF_OPTS=1 ;;
@@ -112,6 +128,12 @@ if (( ! HIDDEN_DISPATCH )); then
       *)           TARGETS+=("$arg") ;;
     esac
   done
+
+  if (( WANT_JOBS )); then
+    print -u2 -- "decant: --jobs needs a value: a positive whole number, or 'auto'"
+    print -u2 -- "       try 'decant --help' for usage"
+    exit 64
+  fi
 
   if (( ${#TARGETS} == 0 )); then
     print -u2 -- "usage: decant [OPTIONS] PATH [PATH ...]"
@@ -131,6 +153,14 @@ typeset -g  SRC_CODEC SRC_FMT SRC_RATE SRC_BITS SRC_BITRATE SRC_DURATION \
 typeset -gi SRC_HAS_ART
 
 typeset -i converted=0 skipped=0 failed=0 previewed=0 missing=0 refused=0
+
+# Parallel-run state, every one of it empty in a serial run: the live worker
+# PIDs, the scratch directory they report through, this worker's own in-flight
+# file, the file list a batch of workers is striped across and which worker owns
+# each entry of it, and the plain-file arguments still waiting to be batched.
+typeset -ga WORKER_PIDS BATCH_FILES PENDING_FILES
+typeset -gai BATCH_ASSIGN
+typeset -g  STATE_DIR="" INFLIGHT_FILE=""
 
 # Skips are ordinary, so only real problems change the status. When several
 # occur in one run the most severe wins, in this order.
@@ -697,11 +727,109 @@ discard_output() {
 # means nothing is being written and there is nothing to clean up.
 IN_FLIGHT_DEST=""
 
+# Publish the destination ffmpeg is about to write. Inside a worker it also goes
+# to that worker's own file, so the parent can still find every in-flight output
+# after an interrupt — including one whose worker died before its own trap could
+# run. One writer per file, so the state can never be two workers' paths spliced
+# together. Always cleared BEFORE the original is trashed, which is what stops
+# the sweep in stop_workers discarding a finished output whose source is gone.
+set_inflight() {
+  IN_FLIGHT_DEST="$1"
+  [[ -n "$INFLIGHT_FILE" ]] || return 0
+  if [[ -n "$1" ]]; then
+    print -rn -- "$1" > "$INFLIGHT_FILE" 2>/dev/null
+  else
+    : > "$INFLIGHT_FILE" 2>/dev/null
+  fi
+  return 0
+}
+
+# A worker leaves the announcement to the parent — N workers must not print N
+# copies of one interrupt. Dropping its own partial here is only the fast path;
+# the parent sweeps the same state file afterwards either way.
+worker_signal() {
+  [[ -n "$IN_FLIGHT_DEST" ]] && discard_output "$IN_FLIGHT_DEST"
+  exit 1
+}
+
+# Every process below PIDS, breadth-first. A worker's ffmpeg is a grandchild of
+# this shell: killing the worker alone would leave that ffmpeg reparented to
+# launchd and still writing into the very file we are about to discard.
+worker_tree() {
+  local -a queue kids seen
+  local p kid
+  queue=("$@")
+  while (( ${#queue} )); do
+    p="${queue[1]}"
+    queue=("${(@)queue[2,-1]}")
+    seen+=("$p")
+    kids=(${(f)"$(pgrep -P $p 2>/dev/null)"})
+    for kid in $kids; do
+      [[ "$kid" == <-> ]] && queue+=("$kid")
+    done
+  done
+  print -l -- $seen
+}
+
+# Bring every worker, and every ffmpeg under one, down; reap them; and only then
+# judge what they were half-way through writing. Discarding a destination while
+# its ffmpeg is still alive would delete a file that is about to be rewritten.
+stop_workers() {
+  local name="$1"
+  local -i num="$2" i
+  local -a tree alive partials
+  local p f dest
+
+  # Snapshotted before signalling: once a worker is gone its ffmpeg has been
+  # reparented, and pgrep -P can no longer reach it from here.
+  tree=(${(f)"$(worker_tree $WORKER_PIDS)"})
+  kill -$num $tree 2>/dev/null
+
+  # A worker only reaches its own trap once the ffmpeg it was blocked on has
+  # exited, so give the tree a moment to come apart on its own.
+  for (( i = 1; i <= 100; i++ )); do
+    alive=()
+    for p in $tree; do kill -0 $p 2>/dev/null && alive+=("$p"); done
+    (( ${#alive} )) || break
+    sleep 0.05
+  done
+  # Anything still standing after five seconds is not going to stop politely, and
+  # an ffmpeg that outlived this script would write straight over the discard.
+  (( ${#alive} )) && kill -KILL $alive 2>/dev/null
+
+  for p in $WORKER_PIDS; do wait $p 2>/dev/null; done
+  WORKER_PIDS=()
+
+  if [[ -n "$STATE_DIR" ]]; then
+    for f in "$STATE_DIR"/inflight.*(N); do
+      [[ -s "$f" ]] || continue
+      dest="$(<"$f")"
+      [[ -n "$dest" ]] || continue
+      discard_output "$dest"
+      log_line "INTERRUPTED ($name) discarded partial output $dest"
+      partials+=("$dest")
+      : > "$f"
+    done
+  fi
+
+  if (( ${#partials} == 1 )); then
+    print -u2 "decant: interrupted ($name) — discarded the partial ${partials[1]:t}"
+  elif (( ${#partials} )); then
+    print -u2 "decant: interrupted ($name) — discarded ${#partials} partial outputs"
+  else
+    print -u2 "decant: interrupted ($name)"
+  fi
+}
+
 # zsh defers a trap until the foreground child returns, so this runs once the
 # signalled ffmpeg is gone — after which the half-written file is safe to drop.
+# Under --jobs there are N of those files and N children holding them open, so
+# that case reaps first and cleans up second.
 on_signal() {
   local name="$1" num="$2"
-  if [[ -n "$IN_FLIGHT_DEST" ]]; then
+  if (( ${#WORKER_PIDS} )); then
+    stop_workers "$name" "$num"
+  elif [[ -n "$IN_FLIGHT_DEST" ]]; then
     discard_output "$IN_FLIGHT_DEST"
     log_line "INTERRUPTED ($name) discarded partial output $IN_FLIGHT_DEST"
     print -u2 "decant: interrupted ($name) — discarded the partial ${IN_FLIGHT_DEST:t}"
@@ -711,9 +839,20 @@ on_signal() {
   fi
   exit $(( 128 + num ))
 }
+# Removing nothing is the normal case: a serial run never makes a scratch
+# directory. This has to be armed here at the top level rather than where the
+# directory is created, because zsh runs an EXIT trap set inside a function the
+# moment that function returns — which would delete the directory before a
+# single worker had written to it.
+cleanup_state() {
+  [[ -n "$STATE_DIR" ]] && rm -rf -- "$STATE_DIR" 2>/dev/null
+  return 0
+}
+
 trap 'on_signal INT 2'   INT
 trap 'on_signal TERM 15' TERM
 trap 'on_signal HUP 1'   HUP
+trap 'cleanup_state'     EXIT
 
 # Sets CONVERT_ERR on total failure and ART_DROPPED when the art-preserving
 # attempt fails but the audio-only fallback succeeds. Writes straight to "$out".
@@ -887,9 +1026,9 @@ process_file() {
   # rename/delete a file a child process (ffmpeg) created — which is why the
   # old "ffmpeg → temp, shell mv → dest" approach failed in Downloads/Desktop/
   # Documents. The original is trashed only after the output is verified valid.
-  IN_FLIGHT_DEST="$dest"
+  set_inflight "$dest"
   if convert_file "$src" "$tgt" "$dest" "$out_fmt" && [[ -s "$dest" ]] && valid_audio "$dest"; then
-    IN_FLIGHT_DEST=""
+    set_inflight ""
     local trashed=1
     trash_original "$src" || trashed=0
     print -u2 -- "decant: converted ${src:t} → ${dest:t} ($label)"
@@ -907,11 +1046,130 @@ process_file() {
     (( converted++ ))
   else
     discard_output "$dest"
-    IN_FLIGHT_DEST=""
+    set_inflight ""
     print -u2 "decant: FAILED ${src:t}"
     log_line "FAILED $src [$tgt] :: ${CONVERT_ERR:-unknown error}"
     (( failed++ ))
   fi
+}
+
+# Per-run scratch for the workers' in-flight destinations and their tallies.
+# Created only when --jobs actually asks for workers, so a serial run makes
+# nothing and has nothing to clean up.
+ensure_state_dir() {
+  [[ -n "$STATE_DIR" ]] && return 0
+  STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/decant.XXXXXX" 2>/dev/null) || { STATE_DIR=""; return 1 }
+  return 0
+}
+
+# One worker's share of a batch. It re-reads the shared file list rather than
+# being handed a slice of it: zsh has no nested arrays, and the fork has already
+# given this process a private copy of everything the parent had.
+worker_main() {
+  local -i id=$1 i
+  # A worker has no workers of its own. Without this it would inherit the PIDs of
+  # the siblings forked before it and try to stop them on a signal.
+  WORKER_PIDS=()
+  INFLIGHT_FILE="$STATE_DIR/inflight.$id"
+  : > "$INFLIGHT_FILE"
+  trap 'worker_signal' INT TERM HUP
+  # The fork carried the parent's running totals in with it. Report only this
+  # worker's own share; the parent adds the stripes back together.
+  converted=0 skipped=0 failed=0 previewed=0
+  for (( i = 1; i <= ${#BATCH_FILES}; i++ )); do
+    (( BATCH_ASSIGN[i] == id )) || continue
+    process_file "${BATCH_FILES[i]}"
+  done
+  print -r -- "$converted $skipped $failed $previewed" > "$STATE_DIR/counts.$id"
+}
+
+# Stripe a batch across JOBS workers, then add up what they each did.
+run_batch_parallel() {
+  BATCH_FILES=("$@")
+  BATCH_ASSIGN=()
+
+  local -A stem_worker
+  local key p
+  local -a tally
+  local -i i nf=${#BATCH_FILES} next=0 w nworkers=$JOBS
+  (( nworkers > nf )) && nworkers=$nf
+
+  # Two sources in one folder can target the same output — track.flac and
+  # track.wav both make track.aiff. Serial order resolved that: the first
+  # converts, the second finds a valid destination sitting there and skips it.
+  # Keeping such a pair on ONE worker, in snapshot order, is what makes that
+  # still happen; racing them would put two ffmpegs on one path and trash both
+  # originals. The key is lowercased because macOS filesystems are
+  # case-insensitive by default, where Track.wav and track.flac really do collide.
+  for (( i = 1; i <= nf; i++ )); do
+    key="${${BATCH_FILES[i]:r}:l}"
+    if (( ${+stem_worker[$key]} )); then
+      w=$stem_worker[$key]
+    else
+      w=$(( next % nworkers + 1 ))
+      (( next++ ))
+      stem_worker[$key]=$w
+    fi
+    BATCH_ASSIGN[i]=$w
+  done
+
+  # Rotate here rather than from inside a worker: N workers each checking the
+  # size for themselves would race, and the loser would rename away a log the
+  # winner had already started writing this run's lines into.
+  (( LOG_ROTATE_CHECKED )) || rotate_log
+
+  WORKER_PIDS=()
+  for (( w = 1; w <= nworkers; w++ )); do
+    worker_main $w &
+    WORKER_PIDS+=($!)
+  done
+  for p in $WORKER_PIDS; do wait $p 2>/dev/null; done
+  WORKER_PIDS=()
+
+  for (( w = 1; w <= nworkers; w++ )); do
+    if [[ -s "$STATE_DIR/counts.$w" ]]; then
+      tally=(${=$(<"$STATE_DIR/counts.$w")})
+      (( converted += tally[1], skipped += tally[2], failed += tally[3], previewed += tally[4] ))
+    else
+      # A worker that died without reporting took its share of the tally with it.
+      # Counting that as a failure is the only honest answer available: the run
+      # must not exit 0 for files whose outcome nobody recorded.
+      print -u2 "decant: FAILED a worker exited without reporting its results"
+      log_line "FAILED worker $w of $nworkers exited without reporting"
+      (( failed++ ))
+    fi
+    rm -f -- "$STATE_DIR/counts.$w" 2>/dev/null
+  done
+
+  BATCH_FILES=(); BATCH_ASSIGN=()
+}
+
+# Convert one snapshot of files. Serial is the default and is deliberately the
+# same loop it has always been, down to the order of the lines it prints; --jobs
+# stripes the same list across workers instead. A scratch directory that cannot
+# be made is a reason to run serially, never a reason to fail the run.
+run_batch() {
+  local -a files=("$@")
+  (( ${#files} )) || return 0
+  if (( JOBS > 1 )) && ensure_state_dir; then
+    run_batch_parallel "${files[@]}"
+    return 0
+  fi
+  local f
+  for f in "${files[@]}"; do
+    process_file "$f"
+  done
+}
+
+# Plain-file arguments pile up here so a run over several of them converts as one
+# batch, and are flushed at every point where output order would otherwise
+# change — before a folder is walked, and before any path-level message — so the
+# lines still come out in the order the paths were given.
+flush_pending() {
+  (( ${#PENDING_FILES} )) || return 0
+  local -a batch=("${PENDING_FILES[@]}")
+  PENDING_FILES=()
+  run_batch "${batch[@]}"
 }
 
 # Recursing one of these would scan an enormous tree and trash audio all over
@@ -934,18 +1192,27 @@ process_path() {
   # Anchoring to the cwd here is what makes `decant -- -foo.flac` convertible.
   [[ "$p" == -* ]] && p="./$p"
   if is_forbidden_root "$p"; then
+    flush_pending
     print -u2 "decant: refusing to recurse '$p' (too broad — point me at a file or an album folder)"
     log_line "REFUSED (forbidden root) $p"
     (( refused++ )); return
   fi
   if [[ -d "$p" ]]; then
+    flush_pending
+    # Snapshot the tree before converting any of it. Streaming find(1) straight
+    # into the loop let an output written moments ago be handed back by the same
+    # find; collecting first also gives --jobs the whole list to stripe. -print0
+    # because these names hold spaces, quotes, newlines and unicode.
+    local -a files
     local file
     while IFS= read -r -d '' file; do
-      process_file "$file"
+      files+=("$file")
     done < <(find "$p" -type f -print0)
+    run_batch "${files[@]}"
   elif [[ -f "$p" ]]; then
-    process_file "$p"
+    PENDING_FILES+=("$p")
   else
+    flush_pending
     print -u2 "decant: not found: $p"
     log_line "MISSING $p"
     (( missing++ ))
@@ -981,6 +1248,63 @@ case "${1:-}" in
   --resample-args)     cdj_resample_args "${2:-}"; print -r -- "${RESAMPLE_ARGS[*]}"; exit 0 ;;
 esac
 
+# The machine's logical core count, for --jobs auto. Falls back rather than
+# failing: a wrong guess here costs throughput, never correctness.
+_cpu_count() {
+  local n
+  n=$(sysctl -n hw.ncpu 2>/dev/null)
+  [[ "$n" == <-> ]] && (( n >= 1 )) && { print -r -- "$n"; return }
+  n=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
+  [[ "$n" == <-> ]] && (( n >= 1 )) && { print -r -- "$n"; return }
+  print -r -- 1
+}
+
+# Turn a --jobs/DECANT_JOBS value into a worker count, or refuse it outright.
+# Anything that is neither 'auto' nor a positive whole number is a usage error
+# rather than something to coerce: reading "8x" as 8 would parallelise a run
+# nobody asked to parallelise, and reading it as 0 would fork no workers at all.
+# Only a plain digit string counts as a number, for the same reason
+# mp3_bitrate_for insists on one — zsh arithmetic expands a bare word as a
+# variable name and keeps expanding it.
+jobs_usage_error() {
+    print -u2 -- "decant: --jobs needs a positive whole number, or 'auto': $1"
+    print -u2 -- "       try 'decant --help' for usage"
+    exit 64
+}
+
+resolve_jobs() {
+  local want="$1"
+  local -i n over=0
+  if [[ "$want" == auto ]]; then
+    n=$(_cpu_count)
+  elif [[ "$want" == <-> ]]; then
+    # Six digits is already absurd, and a value long enough to overflow zsh's
+    # integers would wrap round to something that looks perfectly reasonable —
+    # so the digit count is judged before the string reaches any arithmetic.
+    if (( ${#want} > 6 )); then over=1; else n=$want; fi
+    (( over || n >= 1 )) || jobs_usage_error "$want"
+  else
+    jobs_usage_error "$want"
+  fi
+  # A four-digit --jobs is a typo, not a plan: cap it rather than forking a
+  # thousand ffmpegs at a machine that has a dozen cores.
+  if (( over || n > JOBS_MAX )); then
+    print -u2 -- "decant: --jobs $want is above the $JOBS_MAX-worker ceiling — using $JOBS_MAX"
+    n=$JOBS_MAX
+  fi
+  JOBS=$n
+}
+
+# The flag wins over the variable, so the two can never disagree — the same
+# single-source-of-truth rule --keep follows for DECANT_KEEP_ORIGINALS. An
+# explicitly empty --jobs "" is a usage error, not a request for the default,
+# which is why the flag being given is tracked apart from its value.
+if (( JOBS_GIVEN )); then
+  resolve_jobs "$JOBS_REQUEST"
+elif [[ -n "${DECANT_JOBS:-}" ]]; then
+  resolve_jobs "$DECANT_JOBS"
+fi
+
 ensure_tools
 
 # As a Finder Quick Action, the "Run Shell Script" action captures whatever the
@@ -998,6 +1322,7 @@ log_debug "RUN start: $*"
 for arg in "${TARGETS[@]}"; do
   process_path "$arg"
 done
+flush_pending
 
 if (( DRYRUN )); then
   print -u2 -- "decant: dry run — ${previewed} file(s) would convert, nothing changed"
