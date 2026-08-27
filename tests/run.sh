@@ -1660,6 +1660,164 @@ assert_eq   "a file with no tags at all still gets its track backfilled" "6" \
 assert_eq   "…and no title is invented for it" "" \
             "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$SO/06 - Bare.aiff")"
 
+print -r -- "source probe: tag keys are read whatever case they are written in"
+# #given that ffprobe reports whatever case the container stored. Only some
+# keys are folded by ffmpeg's metadata conversion on the way out: Vorbis
+# comments keep TITLE and GROUPING verbatim — the spec calls the key
+# case-insensitive and the convention is upper case — Matroska upper-cases
+# every SimpleTag name it writes, and an MP3's TXXX description survives as
+# typed. TRACKNUMBER and DISCNUMBER are among the handful that do get folded.
+#
+# Every fixture here sits in a catalog folder under a numbered filename, so a
+# key the probe fails to see is not merely missed: it is replaced by the value
+# decant derives, which is the one outcome fill-gaps-only exists to prevent.
+
+# One tag's value. ffprobe's own -show_entries filter matches the name without
+# regard to case, so this reads a TITLE and a title alike.
+tagval() { probe -show_entries format_tags="$2" -of default=nw=1:nk=1 -- "$1" }
+
+# How many separate keys in FILE's tags fold to KEY. More than one would mean
+# a value decant wrote sat down beside the differently-cased key it had copied
+# in, rather than replacing it — the shape a player renders as two titles.
+tag_key_count() {
+  probe -of flat -show_entries format_tags:stream_tags -- "$1" |
+    awk -F= -v want="$2" '{ n = split($1, p, "."); if (tolower(p[n]) == want) c++ } END { print c+0 }'
+}
+
+# Rename one Vorbis comment in a FLAC, in place, to a key of the same length.
+# ffmpeg's writer normalises every spelling it recognises — track is stored as
+# TRACKNUMBER, and setting one key twice replaces it rather than repeating it —
+# so the spellings real taggers emit have to be put there by hand. Equal
+# lengths leave each comment's length prefix correct.
+recase_comment() {
+  local f="$1"
+  FROM="$2" TO="$3" perl -0777 -pe 's/\Q$ENV{FROM}\E=/$ENV{TO}=/' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+}
+has_bytes() { NEEDLE="$2" perl -0777 -ne 'exit(index($_, $ENV{NEEDLE}) < 0)' "$1" }
+
+CS="$WORK/[CASE042] Casing"; mkdir -p "$CS"
+cs_flac() {
+  local out="$1"; shift
+  ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=447:duration=1" \
+    -c:a flac "$@" "$CS/$out"
+}
+cs_flac "03 - Upper.flac" -metadata TITLE="Upper (feat. A)" -metadata GROUPING=UPCAT \
+                          -metadata TRACKNUMBER=7
+cs_flac "04 - Mixed.flac" -metadata Title="Mixed (feat. B)" -metadata Grouping=MXCAT
+cs_flac "05 - Lower.flac" -metadata title="Lower (feat. C)" -metadata grouping=LOCAT
+# #given an .opus, where the same Vorbis comments hang off the stream instead of
+# the format, and whose enrichment is written into an MP3 rather than an AIFF
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=448:duration=2" \
+  -c:a libopus -b:a 96k -metadata TITLE="Opus Upper (feat. D)" -metadata GROUPING=OPCAT \
+  "$CS/06 - OpusUpper.opus"
+# #given an .mka, which no amount of careful tagging could get a grouping past:
+# the Matroska muxer upper-cases the name on the way in, so every one of them
+# was clobbered. The leading "(1 - 07)" offers both a disc and a track, and only
+# the track is genuinely missing.
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=449:duration=1" \
+  -c:a flac -metadata GROUPING=MKCAT -metadata DISC=2 "$CS/(1 - 07) Matroska.mka"
+# #given keys that merely start like ones decant reads: the match is anchored,
+# not a prefix test
+cs_flac "08 - NearMiss.flac" -metadata SUBTITLE="Not A Title" -metadata TITLES="Not One Either"
+# #given the bare TRACK and DISC that ffmpeg itself will not write but plenty of
+# taggers do, both offered by the filename as well
+cs_flac "(1 - 11) RawTrack.flac" -metadata XRACK=5 -metadata XISC=3
+recase_comment "$CS/(1 - 11) RawTrack.flac" XRACK TRACK
+recase_comment "$CS/(1 - 11) RawTrack.flac" XISC DISC
+# #given one file carrying both spellings of the same key, in each order. The
+# merged value differs between them — ffprobe joins them in the order the file
+# lists them — but which spelling comes first must never decide whether decant
+# sees a title at all.
+cs_flac "09 - DupAB.flac" -metadata TITLE="Alpha (feat. One)" -metadata ZITLE="Beta"
+recase_comment "$CS/09 - DupAB.flac" ZITLE title
+cs_flac "10 - DupBA.flac" -metadata ZITLE="Beta" -metadata TITLE="Alpha (feat. One)"
+recase_comment "$CS/10 - DupBA.flac" ZITLE title
+# #given an upper-case key whose value impersonates the parse it arrives in, and
+# breaks the line while it is at it
+CSH=$'Hostile (feat. E) has=equals "quoted" \\back\\\\slash\nstreams.stream.0.tags.TITLE="FORGED"\nünïcødé ✧ $VAR `cmd`\ttab'
+cs_flac "12 - Hostile.flac" -metadata TITLE="$CSH"
+
+assert_true "the raw fixture really carries a bare upper-case TRACK=" \
+            has_bytes "$CS/(1 - 11) RawTrack.flac" "TRACK=5"
+assert_true "…and both spellings of title really are in the one file" \
+            has_bytes "$CS/09 - DupAB.flac" "title=Beta"
+
+DUPAB="$(tagval "$CS/09 - DupAB.flac" title)"
+DUPBA="$(tagval "$CS/10 - DupBA.flac" title)"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$CS" >/dev/null 2>&1
+
+assert_eq   "an upper-case GROUPING counts as present, so the folder's is not written" \
+            "UPCAT" "$(tagval "$CS/03 - Upper.aiff" grouping)"
+assert_eq   "…an upper-case TITLE is found, and its feat. normalized" "Upper (ft. A)" \
+            "$(tagval "$CS/03 - Upper.aiff" title)"
+assert_eq   "…and an upper-case TRACKNUMBER survives the filename's own 03" "7" \
+            "$(tagval "$CS/03 - Upper.aiff" track)"
+assert_eq   "a mixed-case Grouping is present too" "MXCAT" \
+            "$(tagval "$CS/04 - Mixed.aiff" grouping)"
+assert_eq   "…and a mixed-case Title is normalized in place" "Mixed (ft. B)" \
+            "$(tagval "$CS/04 - Mixed.aiff" title)"
+assert_eq   "…while the track it really is missing is still filled in" "4" \
+            "$(tagval "$CS/04 - Mixed.aiff" track)"
+assert_eq   "lower-case keys keep working exactly as they did" "LOCAT" \
+            "$(tagval "$CS/05 - Lower.aiff" grouping)"
+assert_eq   "…including the normalization" "Lower (ft. C)" \
+            "$(tagval "$CS/05 - Lower.aiff" title)"
+assert_eq   "an upper-case GROUPING on an opus stream is present, not derived over" \
+            "OPCAT" "$(tagval "$CS/06 - OpusUpper.mp3" grouping)"
+assert_eq   "…its upper-case TITLE is normalized into the MP3" "Opus Upper (ft. D)" \
+            "$(tagval "$CS/06 - OpusUpper.mp3" title)"
+assert_eq   "…and the track it has no tag for is still backfilled" "6" \
+            "$(tagval "$CS/06 - OpusUpper.mp3" track)"
+assert_eq   "Matroska's always-upper-case GROUPING is finally read" "MKCAT" \
+            "$(tagval "$CS/(1 - 07) Matroska.aiff" grouping)"
+assert_eq   "…and its DISC is not replaced by the filename's disc 1" "2" \
+            "$(tagval "$CS/(1 - 07) Matroska.aiff" disc)"
+assert_eq   "…while the missing track still comes from the filename" "7" \
+            "$(tagval "$CS/(1 - 07) Matroska.aiff" track)"
+assert_eq   "SUBTITLE and TITLES are not read as a title" "" \
+            "$(tagval "$CS/08 - NearMiss.aiff" title)"
+assert_eq   "…so the near-miss file is enriched as the untagged file it is" "CASE042" \
+            "$(tagval "$CS/08 - NearMiss.aiff" grouping)"
+assert_eq   "a bare upper-case TRACK is not overwritten by the filename's 11" "5" \
+            "$(tagval "$CS/(1 - 11) RawTrack.aiff" track)"
+assert_eq   "…nor a bare upper-case DISC by its disc 1" "3" \
+            "$(tagval "$CS/(1 - 11) RawTrack.aiff" disc)"
+assert_eq   "both spellings in one file: the merged title is read and normalized" \
+            "${DUPAB//feat./ft.}" "$(tagval "$CS/09 - DupAB.aiff" title)"
+assert_eq   "…and the other order behaves identically" \
+            "${DUPBA//feat./ft.}" "$(tagval "$CS/10 - DupBA.aiff" title)"
+assert_true "…whichever order it is, a title was found rather than left empty" \
+            test -n "$(tagval "$CS/09 - DupAB.aiff" title)" -a -n "$(tagval "$CS/10 - DupBA.aiff" title)"
+assert_eq   "=, quotes, backslashes, newlines and unicode survive under an upper-case key" \
+            "${CSH//feat./ft.}" "$(tagval "$CS/12 - Hostile.aiff" title)"
+assert_eq   "…and the forged stream-tag line never becomes the title" "0" \
+            "$(grep -cx 'FORGED' <<< "$(tagval "$CS/12 - Hostile.aiff" title)")"
+# The AIFF and MP3 tag chunks are both ID3v2, and title is the one field decant
+# writes over a value the source already had — so it is the one that could end
+# up stored twice under two spellings.
+assert_eq   "the AIFF holds one title, not the copied TITLE plus a written title" "1" \
+            "$(tag_key_count "$CS/03 - Upper.aiff" title)"
+assert_eq   "…and one grouping" "1" \
+            "$(tag_key_count "$CS/03 - Upper.aiff" grouping)"
+assert_eq   "the MP3 holds one title too, where TXXX would have kept both spellings" "1" \
+            "$(tag_key_count "$CS/06 - OpusUpper.mp3" title)"
+assert_eq   "…and one grouping" "1" \
+            "$(tag_key_count "$CS/06 - OpusUpper.mp3" grouping)"
+
+# #given the same upper-case tagging under --no-enrich, where none of the above
+# may happen at all
+CN="$WORK/[CASE099] CasingNoEnrich"; mkdir -p "$CN"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=451:duration=1" \
+  -c:a flac -metadata TITLE="Untouched (feat. F)" -metadata GROUPING=NECAT \
+  "$CN/02 - NoEnrich.flac"
+DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --no-enrich "$CN" >/dev/null 2>&1
+assert_eq   "--no-enrich leaves an upper-case TITLE's feat. alone" "Untouched (feat. F)" \
+            "$(tagval "$CN/02 - NoEnrich.aiff" title)"
+assert_eq   "…writes no folder catalog beside the GROUPING it can now read" "NECAT" \
+            "$(tagval "$CN/02 - NoEnrich.aiff" grouping)"
+assert_eq   "…and still backfills no track" "" \
+            "$(tagval "$CN/02 - NoEnrich.aiff" track)"
+
 print -r -- "source probe: streams are picked by number, not by hash order"
 # #given thirteen streams, so the ordinals run past 9 — where anything sorting
 # them as text puts stream 11 ahead of stream 2. The first audio stream is the
