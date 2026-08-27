@@ -342,6 +342,20 @@ probe_source() {
     "stream=codec_type,codec_name,sample_fmt,sample_rate,bits_per_raw_sample,bit_rate:stream_tags=track,disc,grouping,title:format=duration:format_tags=track,disc,grouping,title" \
     -- "$1" 2>/dev/null)
 
+  # Tag keys are matched case-insensitively and folded to lower case before
+  # they are stored. Vorbis comments are conventionally upper case and the spec
+  # calls their keys case-insensitive, so a spec-following FLAC or Opus arrives
+  # here as TITLE/GROUPING; Matroska upper-cases DISC and GROUPING on its own,
+  # and an MP3's TXXX frames keep whatever case they were written with. A
+  # case-sensitive match reads all of those as absent — and "absent" is the one
+  # answer that makes fill-gaps-only overwrite a tag the user already had.
+  #
+  # Where a tag is spelled more than once, the first one ffprobe prints wins:
+  # streams before the format, streams in index order. That is a fixed total
+  # order over the file, so the winner never depends on which case a key
+  # happened to be written in. Two spellings cannot collide *within* one
+  # section — ffprobe's own dictionary is case-insensitive and merges them
+  # before printing.
   local line key val field idx tag
   local -A stype scodec sfmt srate sbits sbrate tags
   for line in "${(@f)out}"; do
@@ -362,16 +376,14 @@ probe_source() {
           bits_per_raw_sample) sbits[$idx]="$val" ;;
           bit_rate)            sbrate[$idx]="$val" ;;
           # Ogg-family sources keep their Vorbis comments on the stream rather
-          # than the format, so stream tags are read too — and, as when this
-          # was one flat ffprobe dump scanned top to bottom, the first
-          # occurrence of a key wins over any later one.
-          tags.(track|disc|grouping|title))
-            tag="${field#tags.}"
+          # than the format, so stream tags are read too.
+          tags.(#i)(track|disc|grouping|title))
+            tag="${${field#tags.}:l}"
             (( ${+tags[$tag]} )) || { _unflat "$val"; tags[$tag]="$REPLY" } ;;
         esac ;;
       format.duration) SRC_DURATION="$val" ;;
-      format.tags.(track|disc|grouping|title))
-        tag="${key#format.tags.}"
+      format.tags.(#i)(track|disc|grouping|title))
+        tag="${${key#format.tags.}:l}"
         (( ${+tags[$tag]} )) || { _unflat "$val"; tags[$tag]="$REPLY" } ;;
     esac
   done
