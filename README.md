@@ -211,6 +211,17 @@ a pure transcode.
 | **`feat.`→`ft.`** | the `title` itself | `title` | word-anchored (`FEISTY` is safe); the one value that is *edited*, not gap-filled |
 | **Folder artwork** | `cover`, then `folder`, then `front` — `.jpg`, then `.jpeg`, then `.png` — beside the file, or in the album root for a track in a disc subfolder | embedded cover | only if the source has no embedded art |
 
+Tag keys are matched without regard to case. Vorbis comments are conventionally
+upper case (`TITLE`, `GROUPING`) and the spec calls the key case-insensitive;
+Matroska upper-cases its tag names whatever you wrote them as; an MP3's `TXXX`
+description keeps the case it was given. So the four tags above are recognised
+however the file spells them — a tag read as missing is a tag that gets a
+derived value written over it, which is precisely what fill-gaps-only is for.
+If you have already converted FLACs, Opus files or `.mka`s with decant, their
+`grouping` is worth a look: earlier versions could not see an upper-case
+`GROUPING` and replaced it with the folder's catalog number, and left `feat.`
+in an upper-case `TITLE` un-normalized.
+
 Catalog detection rejects look-alikes in the same brackets — format/quality
 words (`[WEB FLAC]`, `[FLAC 24]`), years (`(2026)`), release types (`[EP]`), and
 barcodes (`{…, 5056818805226}`). The heuristics are tuned to scene/label folder
