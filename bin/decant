@@ -777,7 +777,7 @@ worker_tree() {
 stop_workers() {
   local name="$1"
   local -i num="$2" i
-  local -a tree alive partials
+  local -a tree alive late partials
   local p f dest
 
   # Snapshotted before signalling: once a worker is gone its ffmpeg has been
@@ -791,13 +791,33 @@ stop_workers() {
     alive=()
     for p in $tree; do kill -0 $p 2>/dev/null && alive+=("$p"); done
     (( ${#alive} )) || break
+    # A worker can have forked an ffmpeg in the moment between the snapshot and
+    # the signal — on a loaded machine, easily. zsh then defers that worker's
+    # trap until the ffmpeg returns, which for a 300-second encode is never, so
+    # the worker sits there until the SIGKILL below. Rescanning every pass is
+    # what stops that late child being orphaned by it.
+    late=(${(f)"$(worker_tree $alive)"})
+    for p in $late; do
+      (( ${tree[(I)$p]} )) || tree+=("$p")
+    done
+    kill -$num $late 2>/dev/null
     sleep 0.05
   done
-  # Anything still standing after five seconds is not going to stop politely, and
-  # an ffmpeg that outlived this script would write straight over the discard.
-  (( ${#alive} )) && kill -KILL $alive 2>/dev/null
+  # Anything still standing after five seconds is not going to stop politely.
+  # Deepest first: SIGKILLing a worker ahead of its ffmpeg would hand that
+  # ffmpeg to launchd, still writing into the file about to be discarded.
+  if (( ${#alive} )); then
+    alive=(${(f)"$(worker_tree $alive)"})
+    kill -KILL ${(Oa)alive} 2>/dev/null
+  fi
 
   for p in $WORKER_PIDS; do wait $p 2>/dev/null; done
+  # One last look. Anything from the tree still breathing now that its worker
+  # has been reaped is an orphan by definition, and would go on writing into a
+  # destination the sweep below is about to discard.
+  for p in $tree; do
+    kill -0 $p 2>/dev/null && kill -KILL $p 2>/dev/null
+  done
   WORKER_PIDS=()
 
   if [[ -n "$STATE_DIR" ]]; then

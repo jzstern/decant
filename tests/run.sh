@@ -2219,6 +2219,40 @@ assert_eq   "…still orphans no encoder" "0" "$(sandbox_encoders)"
 assert_eq   "…and still leaves the sources byte-identical" \
             "$JK_SUMS" "$(shasum -a 256 "$JK"/*.opus | sort)"
 
+# #when the signal lands while the workers are still STARTING their encoders.
+# A worker that forks ffmpeg in the moment between the handler's process-tree
+# snapshot and its kill keeps that ffmpeg: zsh defers the worker's own trap
+# until the encode returns, so the worker sits there until it is killed
+# outright — and a kill reaching only the worker hands a live encoder to
+# launchd, which then writes straight back over the file just discarded.
+#
+# Waiting for a destination to appear is no use here, because by then every
+# worker has already started its encoder. Only a fixed, short delay lands in
+# that window, so the signal goes in at three of them with far more workers
+# than cores. A delay that turns out to be too early is harmless: there is
+# simply nothing to orphan, and every assertion below still holds.
+kill_parallel_after() {
+  local delay="$1" pid
+  local -i jobs="$2"
+  : > "$JKLOG"
+  rm -f "$JK"/*.mp3(N)
+  DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$JKLOG" "$DECANT" --jobs "$jobs" "$JK" >/dev/null 2>&1 &
+  pid=$!
+  sleep "$delay"
+  kill -TERM $pid 2>/dev/null
+  wait $pid
+}
+for JK_DELAY in 0.05 0.1 0.2; do
+  kill_parallel_after "$JK_DELAY" 16
+  JK_RC=$?
+  assert_eq "a signal $JK_DELAY s in still exits 128+SIGTERM" "143" "$JK_RC"
+  assert_eq "…orphaning no encoder forked after the tree was snapshotted" "0" \
+            "$(sandbox_encoders)"
+  assert_eq "…and leaving no partial output behind" "0" "$(inflight_mp3s)"
+  assert_eq "…with every source untouched" \
+            "$JK_SUMS" "$(shasum -a 256 "$JK"/*.opus | sort)"
+done
+
 print -r -- ""
 print -r -- "Results: ${pass} passed, ${fail} failed"
 (( fail == 0 ))
