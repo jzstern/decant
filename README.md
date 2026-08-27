@@ -87,12 +87,16 @@ bundled Shortcut yourself. It takes about a minute:
    **System Settings ▸ Login Items & Extensions ▸ Finder** → toggle **Decant** on.
    *(Easy to miss — without it the action won't appear in the menu.)*
 3. Right-click any audio files or a folder in Finder →
-   **Quick Actions ▸ Decant**.
-4. **First run only:** macOS asks to let the shortcut access the file(s) —
-   click **Always Allow**. Silent thereafter.
+   **Quick Actions ▸ Decant**. It converts straight away — no permission
+   prompt, for the reason in [Why the shortcut has two
+   actions](#why-the-shortcut-has-two-actions).
 
 It works in protected folders (Desktop / Documents / Downloads) with **no Full
 Disk Access needed** — see [How it works](#how-it-works).
+
+The Quick Action runs `decant --notify --jobs auto`, so a right-clicked album
+converts on every core. Right-click is the one context with no way to pass a
+flag, which is why the parallelism is baked into the shortcut itself.
 
 ### Upgrading from `toaiff`
 
@@ -325,6 +329,40 @@ external volumes) picks a free name Finder-style — `01 - Intro 2.flac` — so 
 same-named track from another album never overwrites one already in there. If
 trashing fails outright, the conversion is still counted as a success, but a
 warning and a `TRASH FAILED` log line make clear the original stayed put.
+
+### Why the shortcut has two actions
+
+The obvious shortcut is one action — hand the Finder selection straight to a
+Run Shell Script. That version works, but macOS asks *"Allow "Decant" to use 1
+folder in a shell script?"* every single time. The grant is per folder, so
+**Always Allow** never ends it: the next album is a new folder and a new
+prompt.
+
+The gate is on file *objects* reaching a shell script, and it is not about file
+permissions — it fires just as readily in `~/Music`, which needs no privilege
+at all. Coercing the selection to its path in place doesn't help either; the
+input is still the Quick Action's file selection.
+
+So the shortcut converts the selection to text in a **separate** action and
+feeds the script *that* action's output:
+
+```
+Receive Files and Folders from Quick Actions
+  ↓
+Get Details of Files ▸ File Path     ← produces plain text
+  ↓
+Run Shell Script                     ← receives text, not files
+  exec decant --notify --jobs auto "$@"
+```
+
+The script gets ordinary paths, nothing is gated, and no prompt appears. Two
+details are load-bearing and easy to break by tidying:
+
+- **Get Details of Files must have File Path selected.** Left unset, the action
+  emits nothing, the script runs with no arguments, and decant exits `64` with
+  a usage error.
+- **Run Shell Script's input must be that action's output**, not Shortcut
+  Input. Pointing it back at the selection restores the prompt.
 
 <details>
 <summary>Why it works in protected folders without Full Disk Access</summary>
