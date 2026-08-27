@@ -122,9 +122,13 @@ fi
 
 # Globals that one function fills in for another to read: build_meta_args sets
 # the first three, process_file the encoder options, convert_file the two
-# outcome flags. Declared here so the hand-off is stated rather than implied.
+# outcome flags, probe_source everything the run knows about the source file.
+# Declared here so the hand-off is stated rather than implied.
 typeset -ga META_ARGS META_PLAN ENC_EXTRA
 typeset -g  ART_INPUT CONVERT_ERR ART_DROPPED
+typeset -g  SRC_CODEC SRC_FMT SRC_RATE SRC_BITS SRC_BITRATE SRC_DURATION \
+            SRC_ART_CODEC SRC_TRACK SRC_DISC SRC_GROUPING SRC_TITLE
+typeset -gi SRC_HAS_ART
 
 typeset -i converted=0 skipped=0 failed=0 previewed=0 missing=0 refused=0
 
@@ -287,21 +291,126 @@ target_codec() {
   fi
 }
 
+# ── One probe per source ────────────────────────────────────────────────────
+# Every fact decant needs about a source — codec, sample format, rate, depth,
+# bitrate, duration, cover art and the four enrichment tags — comes out of a
+# single ffprobe call and is picked apart here in the shell. It used to take
+# four separate probes for a FLAC and eight for an Opus, each with an awk or a
+# grep behind it to pull one value out of one line.
+#
+# -of flat is the writer that survives hostile tag values. Every entry is
+# exactly one line of key.path=value; the key path is built by ffprobe from the
+# section hierarchy, and \n and \r are escaped inside values, so no tag can
+# forge a line — let alone a section — the way it can with the default writer's
+# [STREAM] wrappers. (-of json escapes just as safely, but it nests, and it
+# omits any field whose value is "N/A" — precisely the answer target_codec and
+# source_bitrate need to see for bits_per_raw_sample and bit_rate.)
+
+# Undo the flat writer's escaping into REPLY. It escapes exactly six characters
+# — \n \r \\ \" \` \$ — and nothing else, so splitting on the two-character \\
+# first is what makes the rest unambiguous: every backslash still standing after
+# that split introduces a one-character escape.
+_unflat() {
+  REPLY="$1"
+  [[ "$REPLY" == *'\'* ]] || return 0
+  local p nl=$'\n' cr=$'\r'
+  local -a parts
+  local -i i
+  parts=("${(@ps:\\\\:)REPLY}")
+  for (( i = 1; i <= ${#parts}; i++ )); do
+    p="${parts[i]}"
+    p="${p//\\n/$nl}"
+    p="${p//\\r/$cr}"
+    p="${p//\\\"/\"}"
+    p="${p//\\\`/\`}"
+    p="${p//\\\$/\$}"
+    parts[i]="$p"
+  done
+  REPLY="${(pj:\\:)parts}"
+}
+
+# Fill the SRC_* globals for FILE. All of them stay empty when ffprobe cannot
+# read the file at all (a truncated one prints nothing), which the caller reads
+# as "no audio stream here" exactly as it did before.
+probe_source() {
+  SRC_CODEC=""; SRC_FMT=""; SRC_RATE=""; SRC_BITS=""; SRC_BITRATE=""
+  SRC_DURATION=""; SRC_ART_CODEC=""; SRC_HAS_ART=0
+  SRC_TRACK=""; SRC_DISC=""; SRC_GROUPING=""; SRC_TITLE=""
+
+  local out
+  out=$(ffprobe -v error -of flat -show_entries \
+    "stream=codec_type,codec_name,sample_fmt,sample_rate,bits_per_raw_sample,bit_rate:stream_tags=track,disc,grouping,title:format=duration:format_tags=track,disc,grouping,title" \
+    -- "$1" 2>/dev/null)
+
+  local line key val field idx tag
+  local -A stype scodec sfmt srate sbits sbrate tags
+  for line in "${(@f)out}"; do
+    key="${line%%=*}"
+    val="${line#*=}"
+    # The flat writer quotes strings and leaves numbers bare.
+    [[ "$val" == \"*\" ]] && val="${val[2,-2]}"
+    case "$key" in
+      streams.stream.<->.*)
+        field="${key#streams.stream.}"
+        idx="${field%%.*}"
+        field="${field#*.}"
+        case "$field" in
+          codec_type)          stype[$idx]="$val" ;;
+          codec_name)          scodec[$idx]="$val" ;;
+          sample_fmt)          sfmt[$idx]="$val" ;;
+          sample_rate)         srate[$idx]="$val" ;;
+          bits_per_raw_sample) sbits[$idx]="$val" ;;
+          bit_rate)            sbrate[$idx]="$val" ;;
+          # Ogg-family sources keep their Vorbis comments on the stream rather
+          # than the format, so stream tags are read too — and, as when this
+          # was one flat ffprobe dump scanned top to bottom, the first
+          # occurrence of a key wins over any later one.
+          tags.(track|disc|grouping|title))
+            tag="${field#tags.}"
+            (( ${+tags[$tag]} )) || { _unflat "$val"; tags[$tag]="$REPLY" } ;;
+        esac ;;
+      format.duration) SRC_DURATION="$val" ;;
+      format.tags.(track|disc|grouping|title))
+        tag="${key#format.tags.}"
+        (( ${+tags[$tag]} )) || { _unflat "$val"; tags[$tag]="$REPLY" } ;;
+    esac
+  done
+
+  # The first audio and the first video stream in the file's own order — what
+  # -select_streams a:0 and v:0 used to pick out. A source's cover art is any
+  # video stream at all: Matroska carries real artwork without the attached_pic
+  # disposition, so the flag cannot be the test.
+  local i
+  for i in ${(onk)stype}; do
+    case "${stype[$i]}" in
+      audio)
+        [[ -n "$SRC_CODEC" ]] && continue
+        SRC_CODEC="${scodec[$i]}"; SRC_FMT="${sfmt[$i]}"; SRC_RATE="${srate[$i]}"
+        SRC_BITS="${sbits[$i]}";   SRC_BITRATE="${sbrate[$i]}" ;;
+      video)
+        (( SRC_HAS_ART )) && continue
+        SRC_HAS_ART=1; SRC_ART_CODEC="${scodec[$i]}" ;;
+    esac
+  done
+
+  SRC_TRACK="${tags[track]}";    SRC_DISC="${tags[disc]}"
+  SRC_GROUPING="${tags[grouping]}"; SRC_TITLE="${tags[title]}"
+}
+
 # Echo the source audio bitrate in bps, or nothing when it cannot be measured.
 # Uses the stream's own value when ffprobe knows it; otherwise (Ogg/Opus never
 # stores one) sums the audio packet sizes — NOT the container average, which
-# counts tags and artwork and would overstate the real audio bitrate.
+# counts tags and artwork and would overstate the real audio bitrate. Summing
+# packets is the one measurement the source probe cannot carry, so it costs a
+# second ffprobe — charged only to the files that have no stream bit_rate and a
+# duration to divide the sum by, since without both there is no rate to reach.
 source_bitrate() {
-  local br
-  br=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate \
-         -of default=nw=1:nk=1 -- "$1" 2>/dev/null)
+  local br="$SRC_BITRATE"
   if [[ "$br" != <-> ]]; then
-    local dur
-    dur=$(ffprobe -v error -show_entries format=duration \
-            -of default=nw=1:nk=1 -- "$1" 2>/dev/null)
+    [[ "$SRC_DURATION" == (<->|<->.<->) ]] && (( SRC_DURATION > 0 )) || return 0
     br=$(ffprobe -v error -select_streams a:0 -show_entries packet=size \
            -of csv=p=0 -- "$1" 2>/dev/null |
-         awk -v dur="$dur" 'NF{s+=$1} END{if (s>0 && dur+0>0) printf "%d", s*8/dur}')
+         awk -v dur="$SRC_DURATION" 'NF{s+=$1} END{if (s>0 && dur+0>0) printf "%d", s*8/dur}')
   fi
   [[ "$br" == <-> ]] && print -r -- "$br"
 }
@@ -622,6 +731,7 @@ convert_file() {
   [[ "${src:e:l}" == (opus|ogg|oga) ]] && map_meta+=(-map_metadata 0:s:a:0)
   # CDJs/rekordbox only render JPEG cover art in MP3s, so re-encode any other
   # image format into a baseline JPEG; already-JPEG art is copied bit-exact.
+  # The source's own art format is whatever probe_source read off it.
   local -a art_args
   art_args=(-c:v copy)
   if [[ "$out_fmt" == mp3 ]]; then
@@ -630,8 +740,7 @@ convert_file() {
       art_fmt="${ART_INPUT:e:l}"
       [[ "$art_fmt" == (jpg|jpeg) ]] && art_fmt=mjpeg
     else
-      art_fmt=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
-                  -of default=nw=1:nk=1 -- "$src" 2>/dev/null)
+      art_fmt="$SRC_ART_CODEC"
     fi
     [[ -n "$art_fmt" && "$art_fmt" != mjpeg ]] && art_args=(-c:v mjpeg -q:v 2 -pix_fmt:v yuvj420p)
   fi
@@ -670,11 +779,8 @@ process_file() {
   # Empty file → skip (treat like a non-audio file, never a failure).
   [[ -s "$src" ]] || return
 
-  local info codec bits fmt
-  info=$(ffprobe -v error -select_streams a:0 \
-           -show_entries stream=codec_name,sample_fmt,sample_rate,bits_per_raw_sample \
-           -of default=nw=1 -- "$src" 2>/dev/null)
-  codec=$(print -r -- "$info" | awk -F= '$1=="codec_name"{print $2; exit}')
+  probe_source "$src"
+  local codec="$SRC_CODEC"
 
   # No audio stream → not an audio file. Do nothing.
   [[ -z "$codec" ]] && return
@@ -701,12 +807,9 @@ process_file() {
     (( skipped++ )); return
   fi
 
-  bits=$(print -r -- "$info" | awk -F= '$1=="bits_per_raw_sample"{print $2; exit}')
-  fmt=$(print -r -- "$info" | awk -F= '$1=="sample_fmt"{print $2; exit}')
-
   # Truncated/corrupt file: ffprobe guessed the codec from the extension but
   # cannot determine a sample format. Skip rather than fail the whole run.
-  if [[ -z "$fmt" || "$fmt" == "unknown" ]]; then
+  if [[ -z "$SRC_FMT" || "$SRC_FMT" == "unknown" ]]; then
     log_debug "SKIP (unreadable audio) $src"
     (( skipped++ )); return
   fi
@@ -733,7 +836,7 @@ process_file() {
   local tgt label
   ENC_EXTRA=()
   if [[ "$out_fmt" == aiff ]]; then
-    tgt=$(target_codec "$bits" "$fmt")
+    tgt=$(target_codec "$SRC_BITS" "$SRC_FMT")
     label="$tgt"
   else
     tgt=libmp3lame
@@ -744,33 +847,17 @@ process_file() {
     # CDJs only play MPEG-1 Layer III rates, so an off-spec source rate has to
     # be resampled. Empty for a source already on a supported rate — the AIFF
     # path never resamples at all.
-    local sr; sr=$(print -r -- "$info" | awk -F= '$1=="sample_rate"{print $2; exit}')
-    cdj_resample_args "$sr"
+    cdj_resample_args "$SRC_RATE"
     ENC_EXTRA+=("${RESAMPLE_ARGS[@]}")
     label="mp3 ${kbps}k"
   fi
 
-  # Read existing tags + art presence, then compute the fill-gaps-only
-  # enrichment plan (catalog→grouping, track/disc, feat→ft, folder art).
+  # Compute the fill-gaps-only enrichment plan (catalog→grouping, track/disc,
+  # feat→ft, folder art) from the tags and art the source probe already read.
   # Skipped entirely under --no-enrich / DECANT_NO_ENRICH (pure transcode).
   META_ARGS=(); META_PLAN=(); ART_INPUT=""
   if (( ENRICH )); then
-    # ffprobe prefixes tag keys with "TAG:" and a value can itself contain
-    # "=", so match the prefixed key and keep everything after the first "=".
-    # Stream tags are included because Ogg-family sources (.opus) keep their
-    # Vorbis comments there rather than at the format level.
-    local taginfo cur_track cur_disc cur_grouping cur_title has_art
-    taginfo=$(ffprobe -v error \
-                -show_entries format_tags=track,disc,grouping,title:stream_tags=track,disc,grouping,title \
-                -of default=nw=1 -- "$src" 2>/dev/null)
-    _tagval() { print -r -- "$taginfo" | awk -F= -v k="TAG:$1" '$1==k{print substr($0, index($0,"=")+1); exit}'; }
-    cur_track=$(_tagval track)
-    cur_disc=$(_tagval disc)
-    cur_grouping=$(_tagval grouping)
-    cur_title=$(_tagval title)
-    has_art=$(ffprobe -v error -select_streams v -show_entries stream=codec_name \
-                -of default=nw=1:nk=1 -- "$src" 2>/dev/null | grep -q . && print 1 || print 0)
-    build_meta_args "$src" "$cur_track" "$cur_disc" "$cur_grouping" "$cur_title" "$has_art"
+    build_meta_args "$src" "$SRC_TRACK" "$SRC_DISC" "$SRC_GROUPING" "$SRC_TITLE" "$SRC_HAS_ART"
   fi
 
   if (( DRYRUN )); then
