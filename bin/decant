@@ -16,7 +16,7 @@
 emulate -L zsh
 setopt pipefail extended_glob
 
-DECANT_VERSION="0.2.0"
+DECANT_VERSION="0.3.0"
 
 # Opt-in parallelism, and meant to stay opt-in until concurrency has earned the
 # trust: decant trashes originals, and two ffmpegs racing onto one destination

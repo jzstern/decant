@@ -1,7 +1,7 @@
 # decant
 
 [![tests](https://github.com/jzstern/decant/actions/workflows/tests.yml/badge.svg)](https://github.com/jzstern/decant/actions/workflows/tests.yml)
-[![version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://github.com/jzstern/decant/releases)
+[![version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/jzstern/decant/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
