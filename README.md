@@ -114,6 +114,7 @@ decant track.flac other.wav       # one or more files
 decant --dry-run ~/Music/Album    # preview tags/conversions, write nothing
 decant --keep ~/Music/Album       # convert, but leave the originals in place
 decant --no-enrich ~/Music/Album  # pure transcode, skip all tag enrichment
+decant --jobs auto ~/Music/Album  # convert several files at once
 decant -- -weird-name.flac        # a path that starts with a dash
 decant --help                     # full usage, flags, env vars and exit codes
 decant --version
@@ -275,6 +276,47 @@ re-converts over it — so a single bad interruption can't block a file forever.
 A destination that *is* valid audio is still skipped as before; one that turns
 out to be a **directory** is reported as a failure and left untouched.
 
+### Converting several files at once
+
+Conversions are serial by default: one ffmpeg at a time, however many cores
+the machine has. `--jobs N` (or `DECANT_JOBS=N`) spreads a folder across N
+workers instead, and `--jobs auto` uses the logical core count —
+`sysctl -n hw.ncpu`, which counts every core the OS schedules on, so 18 on an
+M5 Max and 8 on an M1. Anything above 64 is capped at 64, so a mistyped
+`--jobs 888` can't fork-bomb the machine. A value that isn't a positive whole
+number or `auto` is a usage error (exit `64`), never quietly rounded to
+something else.
+
+Measured on an 18-core Apple M5 Max, over 50 files (32 lossless → AIFF,
+18 lossy → MP3, ~30 s each), best of two runs:
+
+| `--jobs` | Wall clock | Speedup |
+|---------:|-----------:|--------:|
+| `1` (default) | 24.0 s | 1.0× |
+| `2` | 14.3 s | 1.7× |
+| `4` | 8.3 s | 2.9× |
+| `8` | 5.7 s | 4.2× |
+| `auto` (18) | 4.5 s | 5.3× |
+
+Returns flatten past `8` because MP3 encoding is what dominates, and only 18
+of those 50 files take that path; the AIFF side is closer to I/O-bound. Your
+own ratio of lossless to lossy will move the numbers.
+
+The default stays serial deliberately. `decant` trashes originals, so the bar
+for parallelism is not that it's faster but that nothing else about a run
+changes. With `--jobs` unset the driver takes the same loop it always did,
+down to the order of the lines it prints; opting in is a decision to make
+per run, not one inherited by everyone on upgrade.
+
+Under `--jobs` an interrupt still discards **every** destination in flight,
+not just one: the run signals each worker and each ffmpeg beneath it, waits
+for them all to exit, and only then decides what to delete — an encoder still
+running would otherwise write straight back over the file just discarded.
+Two sources that target the same output (`track.flac` and `track.wav` both
+want `track.aiff`) are kept on one worker in the order the folder listed
+them, so the result is the same one a serial run gives: the first converts,
+the second finds a valid destination and is skipped.
+
 ### Trashing originals
 
 Originals go to the Trash via `NSFileManager`, which uniquifies names itself.
@@ -325,6 +367,7 @@ conversion.
 | Flag | Env | Effect |
 |------|-----|--------|
 | `--no-enrich` | `DECANT_NO_ENRICH` | Pure transcode; skip all tag enrichment. |
+| `--jobs N` | `DECANT_JOBS` | Convert N files at once. Default `1` (serial); `auto` is the machine's logical core count. Capped at 64 workers. |
 | `--dry-run` | — | Preview the tag/conversion plan; write and trash nothing. |
 | `--keep` | `DECANT_KEEP_ORIGINALS` | Convert without trashing originals (cautious first pass). |
 | `--debug` | `DECANT_DEBUG` | Log every run/conversion/skip, not just errors. |
