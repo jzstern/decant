@@ -298,13 +298,22 @@ is_dsd() {
   esac
 }
 
+# ── Returning a value without forking ───────────────────────────────────────
+# The helpers from here down hand their result back in REPLY instead of
+# printing it. A $(…) around a function that is otherwise pure zsh forks a
+# whole subshell just to carry one string up a stack frame, and a converted
+# file goes through seven of them — thousands of processes over a library.
+# Every one of these sets REPLY on every path, so a value can never be left
+# over from the previous file; those that mean "nothing found" also return
+# non-zero, which is what the hidden --* dispatches print on.
+
 # Choose a big-endian PCM target whose depth is >= the source depth, so the
-# conversion is bit-exact (no truncation, no resampling).
+# conversion is bit-exact (no truncation, no resampling). Sets REPLY.
 target_codec() {
   local bits="$1" fmt="$2"
   case "$fmt" in
-    flt|fltp) print -r -- pcm_f32be; return ;;
-    dbl|dblp) print -r -- pcm_f64be; return ;;
+    flt|fltp) REPLY=pcm_f32be; return ;;
+    dbl|dblp) REPLY=pcm_f64be; return ;;
   esac
   if [[ -z "$bits" || "$bits" == "N/A" ]]; then
     case "$fmt" in
@@ -314,10 +323,10 @@ target_codec() {
       *)         bits=16 ;;
     esac
   fi
-  if   (( bits <= 8  )); then print -r -- pcm_s8
-  elif (( bits <= 16 )); then print -r -- pcm_s16be
-  elif (( bits <= 24 )); then print -r -- pcm_s24be
-  else                        print -r -- pcm_s32be
+  if   (( bits <= 8  )); then REPLY=pcm_s8
+  elif (( bits <= 16 )); then REPLY=pcm_s16be
+  elif (( bits <= 24 )); then REPLY=pcm_s24be
+  else                        REPLY=pcm_s32be
   fi
 }
 
@@ -439,7 +448,8 @@ probe_source() {
   SRC_GROUPING="${tags[grouping]}"; SRC_TITLE="${tags[title]}"
 }
 
-# Echo the source audio bitrate in bps, or nothing when it cannot be measured.
+# Set REPLY to the source audio bitrate in bps, or empty when it cannot be
+# measured.
 # Uses the stream's own value when ffprobe knows it; otherwise (Ogg/Opus never
 # stores one) sums the audio packet sizes — NOT the container average, which
 # counts tags and artwork and would overstate the real audio bitrate. Summing
@@ -448,20 +458,21 @@ probe_source() {
 # duration to divide the sum by, since without both there is no rate to reach.
 source_bitrate() {
   local br="$SRC_BITRATE"
+  REPLY=""
   if [[ "$br" != <-> ]]; then
     [[ "$SRC_DURATION" == (<->|<->.<->) ]] && (( SRC_DURATION > 0 )) || return 0
     br=$(ffprobe -v error -select_streams a:0 -show_entries packet=size \
            -of csv=p=0 -- "$1" 2>/dev/null |
          awk -v dur="$SRC_DURATION" 'NF{s+=$1} END{if (s>0 && dur+0>0) printf "%d", s*8/dur}')
   fi
-  [[ "$br" == <-> ]] && print -r -- "$br"
+  [[ "$br" == <-> ]] && REPLY="$br"
 }
 
-# Highest standard MP3 CBR bitrate (kbps) that does not exceed the source
-# bitrate, so a lossy source is never inflated past its real quality. An
-# unknown source bitrate gets the best MP3 can do (320). The one exception to
-# the cap: 32 kbps is MPEG-1 Layer III's minimum, so anything below that
-# encodes at 32.
+# Set REPLY to the highest standard MP3 CBR bitrate (kbps) that does not
+# exceed the source bitrate, so a lossy source is never inflated past its real
+# quality. An unknown source bitrate gets the best MP3 can do (320). The one
+# exception to the cap: 32 kbps is MPEG-1 Layer III's minimum, so anything
+# below that encodes at 32.
 mp3_bitrate_for() {
   local bps="$1" r
   # Only a plain digit string is a bitrate. zsh's arithmetic context expands a
@@ -469,11 +480,11 @@ mp3_bitrate_for() {
   # anything else has to be rejected here rather than reaching the comparison.
   if [[ "$bps" == <-> ]]; then
     for r in 320 256 224 192 160 128 112 96 80 64 56 48 40 32; do
-      (( bps >= r * 1000 )) && { print -r -- "$r"; return }
+      (( bps >= r * 1000 )) && { REPLY="$r"; return }
     done
-    print -r -- 32
+    REPLY=32
   else
-    print -r -- 320
+    REPLY=320
   fi
 }
 
@@ -522,10 +533,10 @@ cdj_resample_args() {
 # build_meta_args); the only value that is *edited* rather than gap-filled is a
 # title containing "feat.".
 
-# Replace the word "feat." (any case) with "ft." in a title. The literal dot is
-# required, so "FEISTY"/"feature" are left alone. Idempotent.
+# Set REPLY to the title with the word "feat." (any case) replaced by "ft.".
+# The literal dot is required, so "FEISTY"/"feature" are left alone. Idempotent.
 normalize_feat() {
-  print -r -- "${1//(#bi)feat./ft.}"
+  REPLY="${1//(#bi)feat./ft.}"
 }
 
 # Tokens that look like letters+digits but are format/quality markers, not
@@ -549,38 +560,63 @@ _is_catalog_token() {
   return 0
 }
 
-# Echo an uppercase catalog number found in an album folder name, or nothing.
-# Prefers a bracketed token ([], (), {}) over a bare scene token; on ties takes
-# the last one.
+# Set REPLY to an uppercase catalog number found in an album folder name, and
+# return non-zero when there is none. Prefers a bracketed token ([], (), {})
+# over a bare scene token; on ties takes the last one.
 detect_catalog() {
-  local name="$1" tok winner="" g
-  local -a bracketed bare groups
-  groups=("${(@f)$(print -r -- "$name" | grep -oE '\[[^]]+\]|\([^)]+\)|\{[^}]+\}')}")
-  for g in $groups; do
+  local name="$1" tok g closer
+  local -a bracketed bare
+  local -i i=1 j n=${#name}
+  REPLY=""
+  # Walk the name here rather than shelling out to `grep -oE`: one fork per file
+  # cost more than reading every character of every folder name does. This is
+  # the regex's own scan — a group runs from an opener to the next closer of the
+  # SAME kind, so an opener of another kind in between belongs to the group it
+  # sits in rather than starting one of its own.
+  while (( i <= n )); do
+    case "${name[i]}" in
+      '[') closer=']' ;;
+      '(') closer=')' ;;
+      '{') closer='}' ;;
+      *)   (( i++ )); continue ;;
+    esac
+    for (( j = i + 1; j <= n; j++ )); do
+      [[ "${name[j]}" == "$closer" ]] && break
+    done
+    # An opener that never closes, or closes with nothing in between, is not a
+    # group. Resuming one character along rather than past the closer is what
+    # keeps a real group that follows such an opener — "{[SHA300]" — findable.
+    if (( j > n || j == i + 1 )); then
+      (( i++ )); continue
+    fi
+    g="${name[i+1,j-1]}"
     for tok in ${(s: :)${g//[][(){}]/ }}; do
       _is_catalog_token "$tok" && bracketed+=("${tok:u}")
     done
+    i=j+1
   done
   for tok in ${(s: :)${name//[-_]/ }}; do
     _is_catalog_token "$tok" && bare+=("${tok:u}")
   done
-  if   (( ${#bracketed} )); then winner="${bracketed[-1]}"
-  elif (( ${#bare} ));      then winner="${bare[-1]}"
+  if   (( ${#bracketed} )); then REPLY="${bracketed[-1]}"
+  elif (( ${#bare} ));      then REPLY="${bare[-1]}"
   fi
-  [[ -n "$winner" ]] && print -r -- "$winner"
+  [[ -n "$REPLY" ]]
 }
 
-# Echo "disc=N" and/or "track=N" parsed from the LEADING token of a filename
-# (so trailing numbers like a year in the title are never mistaken for a track).
+# Set REPLY to "disc=N" and/or "track=N" parsed from the LEADING token of a
+# filename (so trailing numbers like a year in the title are never mistaken for
+# a track), and return non-zero when neither is there.
 derive_track_disc() {
   local base="${1:t:r}"
   local -a out
+  REPLY=""
   if [[ "$base" == (#b)[[:space:]]#\(([[:space:]]#<1-99>)[[:space:]]#-[[:space:]]#([[:space:]]#<1-999>)[[:space:]]#\)* ]]; then
     out=("disc=$((match[1]))" "track=$((match[2]))")
   elif [[ "$base" == (#b)[[:space:]]#(<1-999>)[[:space:]]#[-._\)]* ]]; then
     out=("track=$((match[1]))")
   fi
-  (( ${#out} )) && print -r -- "${out}"
+  (( ${#out} )) && REPLY="${(j: :)out}"
 }
 
 # Art names and extensions in explicit preference order. A single glob returns
@@ -589,16 +625,18 @@ derive_track_disc() {
 _art_names=(cover folder front)
 _art_exts=(jpg jpeg png)
 
-# Echo the preferred art file sitting directly in DIR, or nothing. Zero-byte
-# files are ignored so a placeholder can never displace a real cover.
+# Set REPLY to the preferred art file sitting directly in DIR, and return
+# non-zero when there is none. Zero-byte files are ignored so a placeholder can
+# never displace a real cover.
 _art_in_dir() {
   local dir="$1" name ext f
   local -a found
+  REPLY=""
   found=("$dir"/(#i)(cover|folder|front).(jpg|jpeg|png)(N-.))
   for name in $_art_names; do
     for ext in $_art_exts; do
       for f in $found; do
-        [[ "${${f:t}:l}" == "$name.$ext" && -s "$f" ]] && { print -r -- "$f"; return 0 }
+        [[ "${${f:t}:l}" == "$name.$ext" && -s "$f" ]] && { REPLY="$f"; return 0 }
       done
     done
   done
@@ -610,7 +648,9 @@ _is_disc_folder() {
   [[ "${1:l}" == (cd|disc|disk)[[:space:]._-]#<0-999> ]]
 }
 
-# Echo the path to cover art for a track living in DIR, or nothing.
+# Set REPLY to the path to cover art for a track living in DIR, and return
+# non-zero when there is none. Every exit runs through _art_in_dir, which
+# clears REPLY before it looks, so a miss cannot report the last file's cover.
 #
 # Multi-disc releases keep the artwork at the album root (Album/cover.jpg) and
 # the tracks one level down (Album/CD1/…), so a disc folder falls back to its
@@ -637,11 +677,11 @@ build_meta_args() {
   local dir="${src:h}" folder="${src:h:t}" base="${src:t}"
 
   if [[ -z "$cur_grouping" ]]; then
-    local cat; cat=$(detect_catalog "$folder")
+    local cat; detect_catalog "$folder"; cat="$REPLY"
     [[ -n "$cat" ]] && { META_ARGS+=(-metadata "grouping=$cat"); META_PLAN+=("grouping=$cat"); }
   fi
 
-  local td kv k; td=$(derive_track_disc "$base")
+  local td kv k; derive_track_disc "$base"; td="$REPLY"
   for kv in ${(s: :)td}; do
     k="${kv%%=*}"
     [[ "$k" == track && -n "$cur_track" ]] && continue
@@ -650,12 +690,12 @@ build_meta_args() {
   done
 
   if [[ -n "$cur_title" ]]; then
-    local nt; nt=$(normalize_feat "$cur_title")
+    local nt; normalize_feat "$cur_title"; nt="$REPLY"
     [[ "$nt" != "$cur_title" ]] && { META_ARGS+=(-metadata "title=$nt"); META_PLAN+=("title=$nt"); }
   fi
 
   if [[ "$has_art" != 1 ]]; then
-    local art; art=$(find_folder_art "$dir")
+    local art; find_folder_art "$dir"; art="$REPLY"
     [[ -n "$art" ]] && { ART_INPUT="$art"; META_PLAN+=("art=${art:t}"); }
   fi
 }
@@ -703,10 +743,15 @@ trash_original() {
 
 # A produced file counts as valid only if ffprobe can read an audio stream
 # from it — guards against trashing the original when ffmpeg exited 0 but
-# wrote something unplayable.
+# wrote something unplayable. Capturing rather than piping into `grep -q .`
+# drops a fork per converted file; the explicit `|| return 1` is what keeps
+# pipefail's half of the old test, so an ffprobe that fails still fails the
+# file however much it managed to print first.
 valid_audio() {
-  ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
-    -of default=nw=1:nk=1 -- "$1" 2>/dev/null | grep -q .
+  local codec
+  codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
+    -of default=nw=1:nk=1 -- "$1" 2>/dev/null) || return 1
+  [[ -n "$codec" ]]
 }
 
 # Best-effort removal of a failed/partial output. ffmpeg created it, so a plain
@@ -1007,11 +1052,14 @@ process_file() {
   local tgt label
   ENC_EXTRA=()
   if [[ "$out_fmt" == aiff ]]; then
-    tgt=$(target_codec "$SRC_BITS" "$SRC_FMT")
+    target_codec "$SRC_BITS" "$SRC_FMT"; tgt="$REPLY"
     label="$tgt"
   else
     tgt=libmp3lame
-    local kbps; kbps=$(mp3_bitrate_for "$(source_bitrate "$src")")
+    # Chaining through REPLY is safe because an argument is expanded before the
+    # function it is passed to runs, so mp3_bitrate_for reads the measured rate
+    # before overwriting it with its own answer.
+    local kbps; source_bitrate "$src"; mp3_bitrate_for "$REPLY"; kbps="$REPLY"
     # -compression_level 0 = LAME's best-quality (slowest) algorithm at the
     # chosen CBR rate.
     ENC_EXTRA=(-b:a "${kbps}k" -compression_level 0)
@@ -1253,10 +1301,10 @@ fi
 # --resample-args is the exception that still shells out to ffmpeg, and that is
 # the point: it reports what this build would genuinely be told to resample with.
 case "${1:-}" in
-  --detect-catalog)    detect_catalog "${2:-}"; exit 0 ;;
-  --derive-track-disc) derive_track_disc "${2:-}"; exit 0 ;;
-  --normalize-feat)    normalize_feat "${2:-}"; exit 0 ;;
-  --mp3-bitrate)       mp3_bitrate_for "${2:-}"; exit 0 ;;
+  --detect-catalog)    detect_catalog "${2:-}" && print -r -- "$REPLY"; exit 0 ;;
+  --derive-track-disc) derive_track_disc "${2:-}" && print -r -- "$REPLY"; exit 0 ;;
+  --normalize-feat)    normalize_feat "${2:-}"; print -r -- "$REPLY"; exit 0 ;;
+  --mp3-bitrate)       mp3_bitrate_for "${2:-}"; print -r -- "$REPLY"; exit 0 ;;
   --is-audio-ext)      is_audio_ext "${2:-}" && exit 0 || exit 2 ;;
   --classify-codec)
     if   is_lossless "${2:-}"; then print -r -- lossless
@@ -1264,7 +1312,7 @@ case "${1:-}" in
     else                            print -r -- lossy
     fi
     exit 0 ;;
-  --folder-art)        find_folder_art "${2:-}"; exit 0 ;;
+  --folder-art)        find_folder_art "${2:-}" && print -r -- "$REPLY"; exit 0 ;;
   --resample-args)     cdj_resample_args "${2:-}"; print -r -- "${RESAMPLE_ARGS[*]}"; exit 0 ;;
 esac
 
