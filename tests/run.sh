@@ -622,6 +622,20 @@ assert_true "shortcut invokes decant via PATH, not a hardcoded path" \
             grep -q 'exec decant --notify' "$PLIST"
 assert_eq   "shortcut no longer hardcodes the ~/.local-only invocation" "0" \
             "$(grep -c '"$HOME/.local/bin/decant" --notify' "$PLIST")"
+# Right-clicking an album is the one context with no way to pass a flag, so the
+# shortcut is where --jobs has to be baked in or it never gets used at all.
+assert_true "shortcut converts in parallel (--jobs auto)" \
+            grep -q 'exec decant --notify --jobs auto' "$PLIST"
+# Handing the Finder selection straight to the shell script makes macOS ask
+# "use 1 folder in a shell script?" for every album, and the grant is per folder
+# so Always Allow never ends it. Both halves of the workaround are easy to undo
+# by tidying, so both are pinned here.
+assert_true "shortcut converts the selection to text first (no per-folder prompt)" \
+            grep -q 'is.workflow.actions.properties.files' "$PLIST"
+assert_true "...with File Path actually selected, or the script gets no arguments" \
+            grep -q '<key>WFContentItemPropertyName</key>' "$PLIST"
+assert_true "...and the script consumes that action's output, not the file selection" \
+            grep -q '<string>ActionOutput</string>' "$PLIST"
 
 print -r -- "safety: forbidden-root guard (checked without scanning)"
 "$DECANT" --check-root "/" >/dev/null 2>&1
