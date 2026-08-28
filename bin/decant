@@ -16,7 +16,7 @@
 emulate -L zsh
 setopt pipefail extended_glob
 
-DECANT_VERSION="0.3.0"
+DECANT_VERSION="0.4.0"
 
 # Parallel by default: concurrency has earned the trust the interrupt,
 # orphan-reaping, and worker/ffmpeg-race tests exist to hold it to, and the
