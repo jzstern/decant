@@ -941,10 +941,19 @@ convert_file() {
   else
     tag_args=(-write_id3v2 1)
   fi
-  # Ogg-family containers keep their Vorbis comments on the STREAM, not the
-  # format, so map those on top of the (usually empty) format-level tags.
-  map_meta=(-map_metadata 0)
-  [[ "${src:e:l}" == (opus|ogg|oga) ]] && map_meta+=(-map_metadata 0:s:a:0)
+  # Some containers (Ogg/Opus always; Matroska and others sometimes) keep tags
+  # on the audio STREAM rather than the format, and probe_source treats those
+  # exactly like format-level tags when deciding what already exists (see the
+  # comment above probe_source: streams win over format there). So the copy
+  # here has to reach the stream dictionary too, or a stream-only tag that
+  # probe_source correctly saw as "present" — and therefore did not
+  # derive a filename-based replacement for — never makes it into the output
+  # at all. -map_metadata copies into the destination without overwriting a
+  # key already set there (confirmed empirically: two calls targeting the
+  # same global metadata are additive, and on a genuine key collision the
+  # first call wins), so the stream mapping is listed first to give it the
+  # same priority on write that it already has on read.
+  map_meta=(-map_metadata 0:s:a:0 -map_metadata 0)
   # CDJs/rekordbox only render JPEG cover art in MP3s, so re-encode any other
   # image format into a baseline JPEG; already-JPEG art is copied bit-exact.
   # The source's own art format is whatever probe_source read off it.

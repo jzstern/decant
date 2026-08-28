@@ -162,9 +162,11 @@ Sample rate and channel layout are never touched (no resampling). AIFF and MP3
 each hold exactly one audio stream, so a source carrying several (an `.mka` with
 alternate mixes, say) contributes its **first** one; everything else the
 container held besides the cover art is left behind. Tags and embedded cover art
-are carried over via `-map_metadata` and an ID3v2 chunk; if the AIFF container
-rejects an embedded image, the audio still converts and the artwork is dropped
-with a logged note.
+are carried over via `-map_metadata` and an ID3v2 chunk — both the container's
+format-level tags and its first audio stream's tags, since some containers
+(Ogg/Opus always, Matroska and others sometimes) keep tags on the stream rather
+than the format; if the AIFF container rejects an embedded image, the audio
+still converts and the artwork is dropped with a logged note.
 
 ### Lossy `.m4a` / `.opus` → MP3
 
@@ -174,9 +176,9 @@ picks the **highest standard MP3 CBR rate that doesn't exceed it** (320 kbps
 max, LAME's best-quality algorithm): a 256 kbps AAC becomes a 256 kbps MP3, a
 96 kbps Opus never becomes a 320 kbps MP3. If the source bitrate is unknown,
 MP3's maximum (320 kbps) is used; a source below MP3's 32 kbps floor encodes
-at 32 (the format's minimum). All tags — including Opus's stream-level Vorbis
-comments — and embedded or folder cover art carry over, and the same
-enrichment applies as on the AIFF path.
+at 32 (the format's minimum). All tags — format-level and stream-level alike,
+including Opus's stream-level Vorbis comments — and embedded or folder cover
+art carry over, and the same enrichment applies as on the AIFF path.
 
 The output is deliberately the most **CDJ/rekordbox-compatible** MP3 possible:
 

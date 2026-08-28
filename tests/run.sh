@@ -1705,7 +1705,9 @@ SO="$WORK/streamtags"; mkdir -p "$SO"
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=542:duration=2" \
   -c:a libopus -b:a 96k -metadata title="Stream Only (feat. Y)" "$SO/07 - Stream.opus"
 # #given an .mka with a track tag on the stream and none on the format: the
-# gap is already filled, so nothing may be derived from the "03 - " prefix
+# gap is already filled, so nothing may be derived from the "03 - " prefix —
+# and the real stream-level value must survive into the output rather than
+# being silently dropped
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=543:duration=1" \
   -c:a flac -metadata:s:a:0 track=4 "$SO/03 - StreamTrack.mka"
 # #given a second audio stream that is the only one carrying a title
@@ -1715,13 +1717,27 @@ ffmpeg -nostdin -hide_banner -loglevel error \
 # #given a source with no tags whatsoever
 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=546:duration=1" \
   -c:a flac -map_metadata -1 "$SO/06 - Bare.flac"
+# #given an .mka with a disc tag on the stream and none on the format: the
+# same drop-on-write bug that hits track hits disc too, since both are
+# fill-gaps-only fields read off the same stream/format dictionaries
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=547:duration=1" \
+  -c:a flac -metadata:s:a:0 disc=5 "$SO/10 - StreamDisc.mka"
+# #given an .mka with a grouping tag on the stream and none on the format,
+# sitting in a folder with no catalog code to derive one from either
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=548:duration=1" \
+  -c:a flac -metadata:s:a:0 grouping="StreamGroup" "$SO/11 - StreamGrouping.mka"
+# #given an .mka with a plain stream-level title that normalize_feat would
+# never touch (no "feat." to rewrite), so nothing but the metadata mapping
+# itself is what keeps it from vanishing
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=549:duration=1" \
+  -c:a flac -metadata:s:a:0 title="Stream Title Plain" "$SO/12 - StreamTitlePlain.mka"
 DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$SO" >/dev/null 2>&1
 assert_eq   "an opus title is read off the stream, not the empty format tags" \
             "Stream Only (ft. Y)" \
             "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$SO/07 - Stream.mp3")"
 assert_eq   "…and the filename still fills the track gap beside it" "7" \
             "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$SO/07 - Stream.mp3")"
-assert_eq   "a stream-level track counts as present, so none is derived" "" \
+assert_eq   "a stream-level track counts as present, so none is derived — and the real value survives into the output" "4" \
             "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$SO/03 - StreamTrack.aiff")"
 assert_eq   "a title on the second audio stream is found like any other" \
             "Second (ft. Z)" \
@@ -1730,6 +1746,16 @@ assert_eq   "a file with no tags at all still gets its track backfilled" "6" \
             "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$SO/06 - Bare.aiff")"
 assert_eq   "…and no title is invented for it" "" \
             "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$SO/06 - Bare.aiff")"
+assert_eq   "a stream-level disc survives the same way a stream-level track does" "5" \
+            "$(probe -show_entries format_tags=disc -of default=nw=1:nk=1 -- "$SO/10 - StreamDisc.aiff")"
+assert_eq   "…and the filename still fills the track gap beside it" "10" \
+            "$(probe -show_entries format_tags=track -of default=nw=1:nk=1 -- "$SO/10 - StreamDisc.aiff")"
+assert_eq   "a stream-level grouping survives with no catalog code around to compete with it" \
+            "StreamGroup" \
+            "$(probe -show_entries format_tags=grouping -of default=nw=1:nk=1 -- "$SO/11 - StreamGrouping.aiff")"
+assert_eq   "a stream-level title with nothing for normalize_feat to rewrite still survives" \
+            "Stream Title Plain" \
+            "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$SO/12 - StreamTitlePlain.aiff")"
 
 print -r -- "source probe: tag keys are read whatever case they are written in"
 # #given that ffprobe reports whatever case the container stored. Only some
