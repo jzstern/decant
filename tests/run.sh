@@ -2034,6 +2034,36 @@ assert_true "--help documents DECANT_JOBS" \
 assert_true "--help names the worker ceiling rather than hiding it" \
             grep -qF -- "At most 64 workers" <<< "$HELP_OUT"
 
+print -r -- "--jobs: with no flag and no DECANT_JOBS at all, the default is parallel"
+# #given neither --jobs nor DECANT_JOBS — the exact case this change is about.
+# Wall-clock timing can't prove concurrency here (flaky in CI, and this file
+# already warns some tests are timing-sensitive), so this proves it
+# structurally instead: ensure_state_dir only ever creates a scratch directory
+# when JOBS > 1 (see run_batch/ensure_state_dir in bin/decant), and it is
+# removed again the moment the run finishes. Watching TMPDIR for that
+# directory while a no-flags run is still in flight is direct proof the
+# parallel path — not the old serial loop — is what "nothing given" now
+# resolves to.
+JDEF="$WORK/jobs-default"; mkdir -p "$JDEF"
+for N in {1..16}; do mkflac "$JDEF/t$N.flac" $(( 500 + N )); done
+JDEF_TMP="$WORK/jobs-default-tmp"; mkdir -p "$JDEF_TMP"
+TMPDIR="$JDEF_TMP" DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$JDEF" >/dev/null 2>&1 &
+JDEF_PID=$!
+typeset -i JDEF_SAW_STATE_DIR=0
+for i in {1..500}; do
+  [[ -n "$(print -rl -- "$JDEF_TMP"/decant.*(N))" ]] && { JDEF_SAW_STATE_DIR=1; break }
+  sleep 0.01
+done
+wait $JDEF_PID
+JDEF_RC=$?
+assert_eq   "a no-flags run over 16 files exits 0" "0" "$JDEF_RC"
+assert_true "...having created the workers' scratch directory — JOBS > 1 was chosen" \
+            test "$JDEF_SAW_STATE_DIR" -eq 1
+assert_true "...and cleaned it back up again once the run finished" \
+            test -z "$(print -rl -- "$JDEF_TMP"/decant.*(N))"
+assert_eq   "...with every file still converted" "16" \
+            "$(print -rl -- "$JDEF"/*.aiff(N) | grep -c .)"
+
 print -r -- "--jobs: a parallel run is indistinguishable from a serial one"
 # #given one corpus reaching every outcome the driver has — lossless and lossy
 # conversions, enrichment, folder art, a plain skip, an already-converted skip,
@@ -2156,6 +2186,51 @@ for N in 1 2 3; do
   assert_true "...of the full source duration" \
             in_range "$(duration_s "$CO/par$N/track.aiff")" 0.95 1.05
 done
+
+print -r -- "--jobs 1: pinned exactly, so flipping the default can never quietly perturb it"
+# #given --jobs 1 IS "today's serial path" — the thing this whole change must
+# never touch. On a single file there is no ordering to disturb, so a run with
+# --jobs 1 and one with no --jobs flag at all (now resolving to 'auto', but
+# JOBS > 1 with only one file to hand out still means exactly one worker takes
+# it) have to land on the same message and the same audio.
+J1S_EXPLICIT="$WORK/jobs-one-single-explicit"; J1S_DEFAULT="$WORK/jobs-one-single-default"
+mkdir -p "$J1S_EXPLICIT" "$J1S_DEFAULT"
+mkflac "$J1S_EXPLICIT/Solo.flac" 730
+mkflac "$J1S_DEFAULT/Solo.flac" 730
+J1S_EXPLICIT_OUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --jobs 1 "$J1S_EXPLICIT" 2>&1 >/dev/null)"
+J1S_DEFAULT_OUT="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" "$J1S_DEFAULT" 2>&1 >/dev/null)"
+assert_eq   "a lone file converts to the same message under --jobs 1 and under no flags at all" \
+            "$J1S_EXPLICIT_OUT" "$J1S_DEFAULT_OUT"
+assert_eq   "...and to bit-identical audio" \
+            "$(pcm_md5 "$J1S_EXPLICIT/Solo.aiff")" "$(pcm_md5 "$J1S_DEFAULT/Solo.aiff")"
+
+# A dedicated multi-file regression pin: not re-proving --jobs 1 works (the
+# rest of this suite already does that), but pinning it so tightly that a
+# later change to how the *default* gets resolved can never perturb --jobs 1
+# itself without tripping this. Two identical corpora, --jobs 1 over each: the
+# stderr lines they print — content AND order — and the audio each file
+# decodes to must come out identical, because nothing about --jobs 1 changed.
+J1A="$WORK/jobs-one-a"; J1B="$WORK/jobs-one-b"
+mkdir -p "$J1A" "$J1B"
+for N in 1 2 3 4; do
+  mkflac "$J1A/0$N - Tone.flac" $(( 740 + N ))
+  mkflac "$J1B/0$N - Tone.flac" $(( 740 + N ))
+done
+J1A_ERR="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --jobs 1 "$J1A" 2>&1 >/dev/null)"
+J1A_RC=$?
+J1B_ERR="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --jobs 1 "$J1B" 2>&1 >/dev/null)"
+J1B_RC=$?
+assert_eq   "both --jobs 1 runs over an identical corpus exit 0" "$J1A_RC" "$J1B_RC"
+assert_eq   "...and print the exact same stderr, line for line, in the exact same order" \
+            "$J1A_ERR" "$J1B_ERR"
+assert_eq   "...naming exactly 4 converted files, not some subset" "4" \
+            "$(grep -c '^decant: converted ' <<< "$J1A_ERR")"
+for N in 1 2 3 4; do
+  assert_eq "file 0$N decodes to the exact same audio both times" \
+            "$(pcm_md5 "$J1A/0$N - Tone.aiff")" "$(pcm_md5 "$J1B/0$N - Tone.aiff")"
+done
+J1STD="$(DECANT_KEEP_ORIGINALS=1 DECANT_LOG="$LOG" "$DECANT" --jobs 1 --dry-run "$J1A" 2>/dev/null)"
+assert_eq   "...and --jobs 1 writes nothing to stdout at all" "" "$J1STD"
 
 print -r -- "--jobs: the log survives many workers appending at once"
 # #given far more files than workers, so appends really do collide. Short
