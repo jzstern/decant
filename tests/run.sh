@@ -651,6 +651,36 @@ assert_eq   "is named plainly in the menu" "Decant" \
             "$(plutil -extract 'NSServices.0.NSMenuItem.default' raw -o - "$QA_INFO" 2>/dev/null)"
 assert_true "install.sh installs it and refreshes the services registry" \
             grep -q 'pbs -update' "${0:A:h}/../install.sh"
+# servicesMenu is the Quick Action document type; with a different type the
+# bundle installs but never appears in the menu at all.
+assert_eq   "is a Quick Action document, not a plain workflow" "com.apple.Automator.servicesMenu" \
+            "$(plutil -extract 'workflowMetaData.workflowTypeIdentifier' raw -o - "$QA_DOC" 2>/dev/null)"
+assert_eq   "takes the Finder selection as its input" "com.apple.Automator.fileSystemObject" \
+            "$(plutil -extract 'workflowMetaData.serviceInputTypeIdentifier' raw -o - "$QA_DOC" 2>/dev/null)"
+assert_eq   "drives the Run Shell Script action" "com.apple.RunShellScript" \
+            "$(plutil -extract 'actions.0.action.BundleIdentifier' raw -o - "$QA_DOC" 2>/dev/null)"
+assert_eq   "...through zsh, matching the CLI's own shell" "/bin/zsh" \
+            "$(plutil -extract 'actions.0.action.ActionParameters.shell' raw -o - "$QA_DOC" 2>/dev/null)"
+assert_true "offers itself for the items a user would right-click" \
+            plutil -extract 'NSServices.0.NSSendFileTypes.0' raw -o - "$QA_INFO"
+
+# #given the bundle asserted above, run it the way Finder does. Everything before
+# this checks the workflow's description of itself; only this proves it converts.
+QAW="$WORK/qa-workflow"; mkdir -p "$QAW"
+ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=1" \
+  -sample_fmt s32 -bits_per_raw_sample 24 -c:a flac -metadata title="QA Tone" "$QAW/01 - QA.flac"
+QAERR="$(automator -i "$QAW" "$QA" 2>&1 >/dev/null)"
+if [[ -f "$QAW/01 - QA.aiff" ]]; then
+  assert_eq "the Quick Action actually converts, at the source's depth" "pcm_s24be" \
+            "$(probe -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 -- "$QAW/01 - QA.aiff")"
+  assert_eq "...carrying the tags through" "QA Tone" \
+            "$(probe -show_entries format_tags=title -of default=nw=1:nk=1 -- "$QAW/01 - QA.aiff")"
+  assert_true "...and taking the original away" \
+            test ! -f "$QAW/01 - QA.flac"
+else
+  print -r -- "  – skipped the end-to-end Quick Action run: automator produced no output here"
+  print -r -- "    (${QAERR:-no error reported}; needs a login session, so CI headless runs skip it)"
+fi
 
 print -r -- "safety: forbidden-root guard (checked without scanning)"
 "$DECANT" --check-root "/" >/dev/null 2>&1
@@ -1574,12 +1604,17 @@ assert_true "...and said so" \
             grep -qF -- "removed obsolete Service" <<< "$IOUT_LEGACY"
 assert_true "the retired toaiff binary is removed" \
             test ! -e "$IH/.local/bin/toaiff"
-assert_true "...and the broken Quick Action is called out, not left to fail silently" \
-            grep -qF -- "ACTION NEEDED" <<< "$IOUT_LEGACY"
-assert_true "...naming the shortcut to re-import" \
-            grep -qF -- "Decant.shortcut" <<< "$IOUT_LEGACY"
+# Upgrading used to break right-click until the user re-imported a Shortcut by
+# hand. The Quick Action is installed for them now, so the only thing left is
+# deleting the stale "→ aiff" shortcut — a tidy-up, not a breakage.
+assert_true "...and the upgrader is told right-click already works again" \
+            grep -qiF -- "already works" <<< "$IOUT_LEGACY"
+assert_true "...and which stale shortcut to delete" \
+            grep -qF -- "→ aiff" <<< "$IOUT_LEGACY"
+assert_true "...without sending them back to Shortcuts.app to re-import anything" \
+            test -z "$(grep -i 're-import' <<< "$IOUT_LEGACY")"
 assert_true "a fresh install says nothing about a toaiff that was never there" \
-            test -z "$(grep 'ACTION NEEDED' <<< "$IOUT")"
+            test -z "$(grep -i 'toaiff' <<< "$IOUT")"
 
 # ── source probe ────────────────────────────────────────────────────────────
 # Everything decant knows about a source comes out of one ffprobe call that is

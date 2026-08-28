@@ -49,9 +49,9 @@ if [[ -e "$legacy_bin" ]]; then
   rm -f "$legacy_bin"
   echo "removed previous install: $legacy_bin (now: $bin_dir/decant)"
   echo
-  echo "ACTION NEEDED: your existing Finder Quick Action still runs 'toaiff' and"
-  echo "will now fail. Re-import shortcut/Decant.shortcut, then delete the old"
-  echo "\"→ aiff\" shortcut in Shortcuts.app. See README ▸ \"Upgrading from toaiff\"."
+  echo "The current Quick Action is installed above, so right-click already works."
+  echo "Delete the old \"→ aiff\" shortcut in Shortcuts.app — it still runs 'toaiff'"
+  echo "and will fail. See README ▸ \"Upgrading from toaiff\"."
 fi
 
 echo
