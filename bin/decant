@@ -18,9 +18,13 @@ setopt pipefail extended_glob
 
 DECANT_VERSION="0.3.0"
 
-# Opt-in parallelism, and meant to stay opt-in until concurrency has earned the
-# trust: decant trashes originals, and two ffmpegs racing onto one destination
-# would cost the user both the output and the source that made it.
+# Parallel by default: concurrency has earned the trust the interrupt,
+# orphan-reaping, and worker/ffmpeg-race tests exist to hold it to, and the
+# Finder Quick Action has already been running --jobs auto in production —
+# a terminal run defaulting to one core would just be worse than a right-click.
+# JOBS_MAX still caps a --jobs typo (or a very wide machine) from forking an
+# unreasonable number of workers, and --jobs 1 remains the explicit escape
+# hatch back to the original, fully serial, byte-for-byte behavior.
 typeset -i JOBS=1 JOBS_MAX=64 JOBS_GIVEN=0
 JOBS_REQUEST=""
 
@@ -54,8 +58,9 @@ Options:
   --dry-run       Preview the tag/conversion plan; write and trash nothing.
   --keep          Convert without trashing the originals.
   --no-enrich     Pure transcode; skip all tag enrichment.
-  --jobs N        Convert N files at once. Default 1 (serial); 'auto' is the
-                  machine's logical core count. At most $JOBS_MAX workers.
+  --jobs N        Convert N files at once. Default 'auto' — the machine's
+                  logical core count. At most $JOBS_MAX workers. Pass
+                  --jobs 1 to force the old, fully serial behavior.
   --version       Print the version and exit.
   -h, --help      Print this help and exit.
   --              Treat every remaining argument as a path.
@@ -701,16 +706,26 @@ build_meta_args() {
 }
 
 # Echo a free path inside DIR for NAME, uniquified Finder-style ("Intro.flac",
-# then "Intro 2.flac", "Intro 3.flac", …). The Trash is one flat namespace, so
-# two albums with the same track name would otherwise collide.
+# then "Intro 2.flac", "Intro 3.flac", …), having already claimed it. The Trash
+# is one flat namespace, so two albums with the same track name would
+# otherwise collide — and under --jobs those two originals can easily be
+# trashed by two different workers at once. Testing for a free name and then
+# moving into it are two steps a second worker can slip between, so the claim
+# itself has to be the atomic part: `noclobber` turns a bare `> candidate`
+# into an O_EXCL-style create, making "is this name free" and "it's mine now"
+# one syscall instead of a check a `mv` can race. The loop is capped so a
+# Trash directory that simply cannot be written to fails outright rather than
+# spinning through names that were never going to succeed.
 trash_fallback_dest() {
   local dir="$1" base="${2:t}"
   local stem="${base:r}" ext="${base:e}" n=2 candidate
+  local -i tries=0
   [[ -n "$ext" ]] && ext=".$ext"
   # A name that is nothing but an extension (".flac") has no stem to number.
   [[ -z "$stem" ]] && { stem="$base"; ext="" }
   candidate="$dir/$base"
-  while [[ -e "$candidate" ]]; do
+  while ! ( set -o noclobber; : > "$candidate" ) 2>/dev/null; do
+    (( ++tries > 9999 )) && break
     candidate="$dir/$stem $n$ext"
     (( n++ ))
   done
@@ -1380,6 +1395,8 @@ if (( JOBS_GIVEN )); then
   resolve_jobs "$JOBS_REQUEST"
 elif [[ -n "${DECANT_JOBS:-}" ]]; then
   resolve_jobs "$DECANT_JOBS"
+else
+  resolve_jobs auto
 fi
 
 ensure_tools

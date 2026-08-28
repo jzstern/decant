@@ -279,35 +279,38 @@ out to be a **directory** is reported as a failure and left untouched.
 
 ### Converting several files at once
 
-Conversions are serial by default: one ffmpeg at a time, however many cores
-the machine has. `--jobs N` (or `DECANT_JOBS=N`) spreads a folder across N
-workers instead, and `--jobs auto` uses the logical core count —
-`sysctl -n hw.ncpu`, which counts every core the OS schedules on, so 18 on an
-M5 Max and 8 on an M1. Anything above 64 is capped at 64, so a mistyped
-`--jobs 888` can't fork-bomb the machine. A value that isn't a positive whole
-number or `auto` is a usage error (exit `64`), never quietly rounded to
-something else.
+Conversions run in parallel by default: `decant` spreads a folder across as
+many workers as the machine has logical cores. `--jobs N` (or
+`DECANT_JOBS=N`) picks a specific worker count instead, and `--jobs auto` —
+the default — is spelled out explicitly by `sysctl -n hw.ncpu`, which counts
+every core the OS schedules on, so 18 on an M5 Max and 8 on an M1. Anything
+above 64 is capped at 64, so a mistyped `--jobs 888` can't fork-bomb the
+machine. A value that isn't a positive whole number or `auto` is a usage
+error (exit `64`), never quietly rounded to something else.
 
 Measured on an 18-core Apple M5 Max, over 50 files (32 lossless → AIFF,
 18 lossy → MP3, ~30 s each), best of two runs:
 
 | `--jobs` | Wall clock | Speedup |
 |---------:|-----------:|--------:|
-| `1` (default) | 24.0 s | 1.0× |
+| `1` | 24.0 s | 1.0× |
 | `2` | 14.3 s | 1.7× |
 | `4` | 8.3 s | 2.9× |
 | `8` | 5.7 s | 4.2× |
-| `auto` (18) | 4.5 s | 5.3× |
+| `auto` (18, default) | 4.5 s | 5.3× |
 
 Returns flatten past `8` because MP3 encoding is what dominates, and only 18
 of those 50 files take that path; the AIFF side is closer to I/O-bound. Your
 own ratio of lossless to lossy will move the numbers.
 
-The default stays serial deliberately. `decant` trashes originals, so the bar
-for parallelism is not that it's faster but that nothing else about a run
-changes. With `--jobs` unset the driver takes the same loop it always did,
-down to the order of the lines it prints; opting in is a decision to make
-per run, not one inherited by everyone on upgrade.
+Parallelism used to be opt-in, on the theory that `decant` trashes originals
+and concurrency was unproven. It's proven now: the test suite covers
+interrupt-under-load, orphan process reaping, and the worker/ffmpeg race
+around shutdown, and the Finder Quick Action has been running `--jobs auto`
+in production the whole time. A terminal run defaulting to one core was
+just giving worse throughput than a right-click in Finder. `--jobs 1` is
+still there whenever you want the old behavior back — genuinely serial, one
+ffmpeg at a time, the same loop down to the order of the lines it prints.
 
 Under `--jobs` an interrupt still discards **every** destination in flight,
 not just one: the run signals each worker and each ffmpeg beneath it, waits
@@ -394,7 +397,7 @@ conversion.
 | Flag | Env | Effect |
 |------|-----|--------|
 | `--no-enrich` | `DECANT_NO_ENRICH` | Pure transcode; skip all tag enrichment. |
-| `--jobs N` | `DECANT_JOBS` | Convert N files at once. Default `1` (serial); `auto` is the machine's logical core count. Capped at 64 workers. |
+| `--jobs N` | `DECANT_JOBS` | Convert N files at once. Default `auto` — the machine's logical core count; `--jobs 1` forces serial. Capped at 64 workers. |
 | `--dry-run` | — | Preview the tag/conversion plan; write and trash nothing. |
 | `--keep` | `DECANT_KEEP_ORIGINALS` | Convert without trashing originals (cautious first pass). |
 | `--debug` | `DECANT_DEBUG` | Log every run/conversion/skip, not just errors. |
