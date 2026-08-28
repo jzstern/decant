@@ -614,28 +614,43 @@ assert_true "interactive run (no --notify) still prints its summary" \
 
 # #given the bundled Finder shortcut, which must find the CLI whether it was
 # installed by Homebrew (/opt/homebrew|/usr/local/bin) or install.sh (~/.local/bin)
-print -r -- "quick action shortcut: resolves the CLI regardless of install location"
-PLIST="${0:A:h}/../shortcut/decant.shortcut.plist"
-assert_true "shortcut puts Homebrew bin on PATH (works for brew installs)" \
-            grep -q '/opt/homebrew/bin' "$PLIST"
-assert_true "shortcut invokes decant via PATH, not a hardcoded path" \
-            grep -q 'exec decant --notify' "$PLIST"
-assert_eq   "shortcut no longer hardcodes the ~/.local-only invocation" "0" \
-            "$(grep -c '"$HOME/.local/bin/decant" --notify' "$PLIST")"
+print -r -- "quick action: an Automator workflow, not a Shortcut"
+# A Shortcut handing the Finder selection to a shell script makes macOS ask
+# "use 1 folder in a shell script?" on every run, and the grant is per folder so
+# Always Allow never ends it. Three wirings were tried and all three prompt.
+# Automator has no such gate, so the Quick Action is a .workflow.
+QA="${0:A:h}/../quickaction/Decant.workflow"
+QA_INFO="$QA/Contents/Info.plist"
+QA_DOC="$QA/Contents/Resources/document.wflow"
+assert_true "the workflow bundle ships in the repo" \
+            test -d "$QA"
+assert_true "its Info.plist is valid" \
+            plutil -lint "$QA_INFO"
+assert_true "its workflow document is valid" \
+            plutil -lint "$QA_DOC"
+QA_SCRIPT="$(plutil -extract 'actions.0.action.ActionParameters.COMMAND_STRING' raw -o - "$QA_DOC" 2>/dev/null)"
+assert_true "puts Homebrew bin on PATH (works for brew installs)" \
+            grep -q '/opt/homebrew/bin' <<< "$QA_SCRIPT"
+assert_true "invokes decant via PATH, not a hardcoded path" \
+            grep -q 'exec decant --notify' <<< "$QA_SCRIPT"
 # Right-clicking an album is the one context with no way to pass a flag, so the
-# shortcut is where --jobs has to be baked in or it never gets used at all.
-assert_true "shortcut converts in parallel (--jobs auto)" \
-            grep -q 'exec decant --notify --jobs auto' "$PLIST"
-# Handing the Finder selection straight to the shell script makes macOS ask
-# "use 1 folder in a shell script?" for every album, and the grant is per folder
-# so Always Allow never ends it. Both halves of the workaround are easy to undo
-# by tidying, so both are pinned here.
-assert_true "shortcut converts the selection to text first (no per-folder prompt)" \
-            grep -q 'is.workflow.actions.properties.files' "$PLIST"
-assert_true "...with File Path actually selected, or the script gets no arguments" \
-            grep -q '<key>WFContentItemPropertyName</key>' "$PLIST"
-assert_true "...and the script consumes that action's output, not the file selection" \
-            grep -q '<string>ActionOutput</string>' "$PLIST"
+# Quick Action is where --jobs has to be baked in or it never gets used at all.
+assert_true "converts in parallel (--jobs auto)" \
+            grep -q 'exec decant --notify --jobs auto' <<< "$QA_SCRIPT"
+assert_eq   "passes the selection as arguments, not on stdin" "1" \
+            "$(plutil -extract 'actions.0.action.ActionParameters.inputMethod' raw -o - "$QA_DOC" 2>/dev/null)"
+# NSIconName is what puts the entry under Quick Actions with an icon instead of
+# in the Services submenu — the one key that makes this a Quick Action at all.
+assert_true "declares an icon, so it lands under Quick Actions not Services" \
+            plutil -extract 'NSServices.0.NSIconName' raw -o - "$QA_INFO"
+assert_eq   "is scoped to Finder rather than appearing everywhere" "com.apple.finder" \
+            "$(plutil -extract 'NSServices.0.NSRequiredContext.NSApplicationIdentifier' raw -o - "$QA_INFO" 2>/dev/null)"
+assert_eq   "runs the workflow as a service" "runWorkflowAsService" \
+            "$(plutil -extract 'NSServices.0.NSMessage' raw -o - "$QA_INFO" 2>/dev/null)"
+assert_eq   "is named plainly in the menu" "Decant" \
+            "$(plutil -extract 'NSServices.0.NSMenuItem.default' raw -o - "$QA_INFO" 2>/dev/null)"
+assert_true "install.sh installs it and refreshes the services registry" \
+            grep -q 'pbs -update' "${0:A:h}/../install.sh"
 
 print -r -- "safety: forbidden-root guard (checked without scanning)"
 "$DECANT" --check-root "/" >/dev/null 2>&1
@@ -1528,8 +1543,15 @@ assert_eq   "...and the installed copy runs" "$("$DECANT" --version)" \
             "$("$IBIN" --version)"
 assert_true "the installer says where it put it" \
             grep -qF -- "installed: $IBIN" <<< "$IOUT"
-assert_true "...and points at the Quick Action recipe it cannot install for you" \
-            grep -qF -- "Finder Quick Action" <<< "$IOUT"
+# The Quick Action used to be a Shortcut, which only the user could add through
+# Shortcuts.app. An Automator workflow is just a bundle, so the installer places
+# it and the user does nothing.
+assert_true "...and installs the Quick Action itself, no manual step" \
+            grep -qF -- "installed: $IH/Library/Services/Decant.workflow" <<< "$IOUT"
+assert_true "the Quick Action really lands in the throwaway HOME" \
+            test -d "$IH/Library/Services/Decant.workflow"
+assert_true "...and tells upgraders to delete the old Shortcut" \
+            grep -qF -- "Shortcuts.app" <<< "$IOUT"
 assert_true "a bin dir that is not on PATH gets the PATH tip" \
             grep -qF -- "add $IH/.local/bin to your PATH" <<< "$IOUT"
 IOUT_PATH="$(HOME="$IH" PATH="$IH/.local/bin:$PATH" zsh "$INSTALLER" 2>&1)"

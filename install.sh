@@ -1,9 +1,13 @@
 #!/usr/bin/env zsh
 #
-# Installs the decant CLI. The right-click Finder integration is a Shortcut you
-# add once via Shortcuts.app (see README "Finder Quick Action") — on macOS
-# Sequoia/Tahoe a hand-built .workflow can only ever be a Service, not a true
-# Quick Action, so this installer no longer ships one.
+# Installs the decant CLI and its Finder Quick Action.
+#
+# The Quick Action is an Automator .workflow rather than a Shortcut. A Shortcut
+# that hands the Finder selection to a shell script makes macOS ask "Allow
+# "Decant" to use 1 folder in a shell script?" on every run, and the grant is
+# per folder, so Always Allow never ends it. Automator services do not go
+# through that gate. Registering NSIconName is what puts it under Quick Actions
+# with an icon instead of in the Services submenu.
 
 emulate -L zsh
 set -e
@@ -14,6 +18,17 @@ bin_dir="$HOME/.local/bin"
 mkdir -p "$bin_dir"
 install -m 0755 "$here/bin/decant" "$bin_dir/decant"
 echo "installed: $bin_dir/decant"
+
+# The Quick Action goes in by copy — unlike a Shortcut, which macOS only lets
+# the user add themselves through Shortcuts.app.
+services_dir="$HOME/Library/Services"
+quick_action="$services_dir/Decant.workflow"
+mkdir -p "$services_dir"
+rm -rf "$quick_action"
+cp -R "$here/quickaction/Decant.workflow" "$quick_action"
+# Without this the entry doesn't appear until the next login.
+/System/Library/CoreServices/pbs -update 2>/dev/null || true
+echo "installed: $quick_action"
 
 # Remove the obsolete Service bundle from earlier versions, if present, so it
 # doesn't linger in the right-click Services submenu. (Named for the Service as
@@ -40,10 +55,12 @@ if [[ -e "$legacy_bin" ]]; then
 fi
 
 echo
-echo "CLI installed. Try it:  $bin_dir/decant /path/to/file-or-folder"
+echo "Installed. Try it:  $bin_dir/decant /path/to/file-or-folder"
+echo "Or right-click audio in Finder ▸ Quick Actions ▸ Decant."
 echo
-echo "To add the Finder right-click Quick Action, follow the Shortcuts recipe"
-echo "in README.md (section: \"Finder Quick Action\"). It takes about a minute."
+echo "If you used the older Shortcuts-based Quick Action, delete the 'Decant'"
+echo "shortcut in Shortcuts.app — otherwise two identically named entries appear"
+echo "in the menu and the Shortcut one still asks permission for every folder."
 case ":$PATH:" in
   *":$bin_dir:"*) ;;
   *) echo

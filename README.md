@@ -76,27 +76,22 @@ install already has it. Otherwise, on the first run that needs it:
   `--notify` that message arrives as a notification, since the Quick Action has
   no visible output.
 
-### Add the Finder right-click action (one time)
+### The Finder right-click action
 
-macOS won't let an installer register a Finder Quick Action — you add the
-bundled Shortcut yourself. It takes about a minute:
+`install.sh` and the Homebrew formula both install it — right-click audio files
+or a folder in Finder ▸ **Quick Actions** ▸ **Decant**. No setup, and no
+permission prompt.
 
-1. Double-click [`shortcut/Decant.shortcut`](shortcut/) → **Add Shortcut**.
-   It's pre-built to receive Files & Folders and run the CLI.
-2. **Enable it.** macOS imports Shortcut Quick Actions *disabled*. Turn it on in
-   **System Settings ▸ Login Items & Extensions ▸ Finder** → toggle **Decant** on.
-   *(Easy to miss — without it the action won't appear in the menu.)*
-3. Right-click any audio files or a folder in Finder →
-   **Quick Actions ▸ Decant**. It converts straight away — no permission
-   prompt, for the reason in [Why the shortcut has two
-   actions](#why-the-shortcut-has-two-actions).
+It runs `decant --notify --jobs auto`, so a right-clicked album converts on
+every core. Right-click is the one context with no way to pass a flag, which is
+why the parallelism is baked into the action itself.
 
 It works in protected folders (Desktop / Documents / Downloads) with **no Full
 Disk Access needed** — see [How it works](#how-it-works).
 
-The Quick Action runs `decant --notify --jobs auto`, so a right-clicked album
-converts on every core. Right-click is the one context with no way to pass a
-flag, which is why the parallelism is baked into the shortcut itself.
+> **Upgrading from the Shortcuts version?** Delete the **Decant** shortcut in
+> Shortcuts.app. Otherwise two identically named entries appear in the
+> right-click menu, and the Shortcut one still asks permission for every folder.
 
 ### Upgrading from `toaiff`
 
@@ -330,52 +325,44 @@ same-named track from another album never overwrites one already in there. If
 trashing fails outright, the conversion is still counted as a success, but a
 warning and a `TRASH FAILED` log line make clear the original stayed put.
 
-### Why the shortcut has two actions
+### Why the Quick Action is an Automator workflow
 
-The obvious shortcut is one action — hand the Finder selection straight to a
-Run Shell Script. That version works, but macOS asks *"Allow "Decant" to use 1
-folder in a shell script?"* every single time. The grant is per folder, so
-**Always Allow** never ends it: the next album is a new folder and a new
+The obvious build is a Shortcut: receive the Finder selection, hand it to a Run
+Shell Script action. That works, but macOS then asks *"Allow "Decant" to use 1
+folder in a shell script?"* on **every run**. The grant is per folder, so
+**Always Allow** never ends it — the next album is a new folder and a new
 prompt.
 
-The gate is on file *objects* reaching a shell script, and it is not about file
-permissions — it fires just as readily in `~/Music`, which needs no privilege
-at all. Coercing the selection to its path in place doesn't help either; the
-input is still the Quick Action's file selection.
+It is not a file-permissions problem. It fires just as readily in `~/Music`,
+which needs no privilege at all, so Full Disk Access does not help. Shortcuts
+gates shell scripts reaching the Finder selection, full stop. Three wirings
+were tried and all three prompt: the selection passed directly, the selection
+coerced to its path in place, and the path passed as text out of a separate
+action.
 
-So the shortcut converts the selection to text in a **separate** action and
-feeds the script *that* action's output:
+Automator services do not go through that gate, so the Quick Action is an
+Automator `.workflow` instead. Two details in its `Info.plist` are
+load-bearing:
 
-```
-Receive Files and Folders from Quick Actions
-  ↓
-Get Details of Files ▸ File Path     ← produces plain text
-  ↓
-Run Shell Script                     ← receives text, not files
-  exec decant --notify --jobs auto "$@"
-```
-
-The script gets ordinary paths, nothing is gated, and no prompt appears. Two
-details are load-bearing and easy to break by tidying:
-
-- **Get Details of Files must have File Path selected.** Left unset, the action
-  emits nothing, the script runs with no arguments, and decant exits `64` with
-  a usage error.
-- **Run Shell Script's input must be that action's output**, not Shortcut
-  Input. Pointing it back at the selection restores the prompt.
+- **`NSIconName`** is what puts the entry under **Quick Actions** with an icon
+  rather than in the noisy Services submenu.
+- **`NSRequiredContext`** scopes it to Finder, so it doesn't appear everywhere.
 
 <details>
 <summary>Why it works in protected folders without Full Disk Access</summary>
 
-A Finder Quick Action runs the script sandboxed under `ShortcutsMacHelper`. In
-TCC-protected folders (Desktop / Documents / Downloads) that sandbox lets a
-*child* process (ffmpeg) **create** files but won't let the shell **rename or
-delete a file ffmpeg made**. So `decant` has ffmpeg write the output **directly
-to its final name** (no temp + rename) and trashes the original via
-`NSFileManager`, which the Quick Action's scoped access to the selected file
-permits. That's also why a true Quick Action here must be a Shortcut: a
-hand-built Automator `.workflow` only ever registers as a *Service* on recent
-macOS.
+A Finder Quick Action runs the script sandboxed. In TCC-protected folders
+(Desktop / Documents / Downloads) that sandbox lets a *child* process (ffmpeg)
+**create** files but won't let the shell **rename or delete a file ffmpeg
+made**. So `decant` has ffmpeg write the output **directly to its final name**
+(no temp + rename) and trashes the original via `NSFileManager`, which the
+Quick Action's scoped access to the selected file permits.
+
+Earlier versions of this note claimed a hand-built Automator `.workflow` could
+only ever register as a *Service* on recent macOS, and that a real Quick Action
+therefore had to be a Shortcut. That is wrong: setting `NSIconName` in the
+workflow's `Info.plist` puts it under **Quick Actions** with an icon. Verified
+on macOS 26.
 </details>
 
 ## Logging
@@ -452,8 +439,13 @@ brew uninstall decant                 # or: rm ~/.local/bin/decant
 rm -f ~/Library/Logs/decant.log
 ```
 
-Then delete the **Decant** shortcut in Shortcuts.app and toggle it off in
-System Settings ▸ Login Items & Extensions ▸ Finder.
+```sh
+rm -rf ~/Library/Services/Decant.workflow
+/System/Library/CoreServices/pbs -update
+```
+
+If you also used the older Shortcuts-based Quick Action, delete the **Decant**
+shortcut in Shortcuts.app.
 
 ## Contributing
 
