@@ -99,8 +99,8 @@ This tool used to be called `toaiff`, and its Quick Action was named **→ aiff*
 That shortcut runs `toaiff`, which no longer exists — so after upgrading, the
 right-click action fails until you replace it:
 
-1. Add the new Quick Action using the steps above.
-2. Delete the old **→ aiff** shortcut in Shortcuts.app.
+`install.sh` and `brew upgrade` both install the current Quick Action for you,
+so all that's left is to delete the old **→ aiff** shortcut in Shortcuts.app.
 
 Two other things moved: every `TOAIFF_*` environment variable is now `DECANT_*`,
 and the log lives at `~/Library/Logs/decant.log` instead of `toaiff.log`.
@@ -428,9 +428,9 @@ When one run hits several of these, the most severe wins: `1` over `77` over
 that a typo or a missing file never reads as success.
 
 > **No stray output files:** as a Finder Quick Action the script runs with
-> `--notify` and no terminal, so it writes nothing to stdout/stderr — which the
-> Shortcuts "Run Shell Script" action would otherwise save as a `stdout.txt` /
-> `stderr.txt` beside your files. Results come from the notification and the log.
+> `--notify` and no terminal, so it writes nothing to stdout/stderr — output
+> from a Run Shell Script action has ended up saved beside the converted files
+> before now. Results come from the notification and the log instead.
 
 ## Uninstall
 
@@ -476,14 +476,14 @@ and run there: macOS trashes files from a non-boot volume into that volume's own
 afterwards. Where a disk image can't be created, those tests print that they
 were skipped rather than falling back to your Trash.
 
-The Quick Action is built from [`shortcut/decant.shortcut.plist`](shortcut/).
-After editing it, re-sign the distributable copy — note the input **must** end
-in `.shortcut` or the signer rejects it:
+The Quick Action is [`quickaction/Decant.workflow`](quickaction/). It is a
+plain bundle — no signing step, unlike the Shortcut it replaced. Edit it either
+in Automator (`open -a Automator quickaction/Decant.workflow`) or by editing
+`Contents/Info.plist` and `Contents/Resources/document.wflow` directly, then
+reinstall with `./install.sh`.
 
-```sh
-cp shortcut/decant.shortcut.plist /tmp/Decant.shortcut
-shortcuts sign --mode anyone --input /tmp/Decant.shortcut --output shortcut/Decant.shortcut
-```
+Keep `NSIconName` in the `Info.plist`: without it the entry drops out of the
+Quick Actions section into the Services submenu.
 
 ## License
 
